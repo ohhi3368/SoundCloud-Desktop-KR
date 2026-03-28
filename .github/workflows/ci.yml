@@ -67,7 +67,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf libasound2-dev
-
       - name: Install dependencies (macos only)
         if: matrix.platform == 'macos-latest'
         run: brew install autoconf automake libtool
@@ -82,7 +81,6 @@ jobs:
           echo "CXX_x86_64_apple_darwin=clang++ -arch x86_64" >> $GITHUB_ENV
           echo "CARGO_TARGET_X86_64_APPLE_DARWIN_LINKER=clang" >> $GITHUB_ENV
           echo "MACOSX_DEPLOYMENT_TARGET=10.13" >> $GITHUB_ENV
-
       - uses: pnpm/action-setup@v4
         with:
           version: 10
@@ -108,59 +106,13 @@ jobs:
         working-directory: desktop
         run: pnpm install --frozen-lockfile
 
-      - name: Prepare Tauri signing env
-        shell: bash
-        env:
-          RAW_TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          RAW_TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          echo "HAS_TAURI_SIGNING=false" >> "$GITHUB_ENV"
-
-          if [ -z "${RAW_TAURI_SIGNING_PRIVATE_KEY:-}" ] || [ -z "${RAW_TAURI_SIGNING_PRIVATE_KEY_PASSWORD:-}" ]; then
-            echo "::notice::Tauri signing secrets are not available. Running unsigned CI build."
-            exit 0
-          fi
-
-          key="$RAW_TAURI_SIGNING_PRIVATE_KEY"
-
-          if printf '%s' "$key" | grep -q '\\n'; then
-            key=$(printf '%b' "${key//\\n/\\n}")
-            echo "::notice::Normalized escaped newlines in TAURI_SIGNING_PRIVATE_KEY"
-          fi
-
-          if printf '%s' "$key" | grep -qi 'public key'; then
-            echo "::error::TAURI_SIGNING_PRIVATE_KEY looks like a public key. Use private key content"
-            exit 1
-          fi
-
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<__TAURI_KEY__"
-            printf '%s\n' "$key"
-            echo "__TAURI_KEY__"
-            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$RAW_TAURI_SIGNING_PRIVATE_KEY_PASSWORD"
-            echo "HAS_TAURI_SIGNING=true"
-          } >> "$GITHUB_ENV"
-
       - name: Build Tauri
-        if: env.HAS_TAURI_SIGNING == 'true'
         uses: tauri-apps/tauri-action@v0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ env.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ env.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: desktop
           args: ${{ matrix.args }}
 
-      - name: Build Tauri (unsigned fallback)
-        if: env.HAS_TAURI_SIGNING != 'true'
-        shell: bash
-        working-directory: desktop
-        run: pnpm tauri build --bundles none ${{ matrix.args }}
-
       - name: Upload artifacts
-        if: env.HAS_TAURI_SIGNING == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ci-${{ matrix.job_name }}
@@ -173,9 +125,6 @@ jobs:
             desktop/src-tauri/target/**/release/bundle/msi/*.msi
             desktop/src-tauri/target/**/release/bundle/dmg/*.dmg
             desktop/src-tauri/target/**/release/bundle/macos/*.tar.gz
-            desktop/src-tauri/target/**/release/bundle/**/*.sig
-            desktop/src-tauri/target/**/release/**/latest*.json
-
   flatpak:
     if: "!contains(github.event.head_commit.message, '!release')"
     name: Flatpak
@@ -195,13 +144,11 @@ jobs:
           git clone --depth=1 https://github.com/flatpak/flatpak-builder-tools.git /tmp/fbt
           pip3 install --root-user-action=ignore --break-system-packages --prefix=/app tomlkit
           pip3 install --root-user-action=ignore --break-system-packages --prefix=/app /tmp/fbt/node
-
       - name: Generate offline sources
         run: |
           cd desktop && npm install --package-lock-only --legacy-peer-deps && cd ..
           flatpak-node-generator npm desktop/package-lock.json -o .github/flatpak/node-sources.json
           python3 /tmp/fbt/cargo/flatpak-cargo-generator.py desktop/src-tauri/Cargo.lock -o .github/flatpak/cargo-sources.json
-
       - name: Fetch Flathub shared-modules
         run: git clone --depth=1 https://github.com/flathub/shared-modules.git .github/flatpak/shared-modules
 
