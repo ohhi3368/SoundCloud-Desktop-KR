@@ -30,7 +30,7 @@ jobs:
           cache: pnpm
           cache-dependency-path: backend/pnpm-lock.yaml
 
-      - name: Install
+      - name: Installing
         working-directory: backend
         run: pnpm install --frozen-lockfile
 
