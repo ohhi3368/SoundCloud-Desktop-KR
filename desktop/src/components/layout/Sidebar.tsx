@@ -26,6 +26,7 @@ const languages = [
   { code: 'en', label: 'English' },
   { code: 'ru', label: 'Русский' },
   { code: 'tr', label: 'Turkce' },
+  { code: 'ko', label: '한국어' },
 ] as const;
 
 const navItems = [
@@ -54,7 +55,7 @@ export const Sidebar = React.memo(() => {
   );
 
   const toggleLanguage = () => {
-    const next = i18n.language === 'ru' ? 'en' : 'ru';
+    const next = languages[(languages.indexOf(currentLang) + 1) % languages.length].code;
     void changeAppLanguage(next);
   };
 

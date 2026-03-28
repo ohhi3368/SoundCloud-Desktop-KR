@@ -50,10 +50,11 @@ import { usePlayerStore } from '../stores/player';
 
 function greetingKey() {
   const h = new Date().getHours();
-  if (h < 6) return 'home.goodNight';
-  if (h < 12) return 'home.goodMorning';
-  if (h < 18) return 'home.goodAfternoon';
-  return 'home.goodEvening';
+  const randomIndex = Math.floor(Math.random() * 3);
+  if (h < 6) return 'home.goodNight.' + randomIndex;
+  if (h < 12) return 'home.goodMorning.' + randomIndex;
+  if (h < 18) return 'home.goodAfternoon.' + randomIndex;
+  return 'home.goodEvening.' + randomIndex;
 }
 
 /* ── Section Header ───────────────────────────────────────── */

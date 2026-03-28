@@ -8,6 +8,7 @@ dist/
 Thumbs.db
 .flatpak-builder
 .claude
+.pnpm-store/
 
 # Tauri build output
 src-tauri/target/
