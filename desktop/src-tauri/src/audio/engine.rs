@@ -259,6 +259,15 @@ pub async fn load_url(
 }
 
 pub fn play(state: State<'_, AudioState>) {
+    // If the device errored (sleep/wake, headphone unplug), reconnect immediately
+    // instead of waiting for stall detection (2s delay).
+    if state.device_error.load(Ordering::Relaxed) {
+        state
+            .audio_tx
+            .send(crate::audio::types::AudioThreadCmd::Reconnect)
+            .ok();
+    }
+    // Always unpause so reload_current_track sees was_paused=false
     if let Ok(player) = state.player.try_lock() {
         if let Some(ref player) = *player {
             player.play();
@@ -298,10 +307,12 @@ pub fn seek(position: f64, state: State<'_, AudioState>) -> Result<(), String> {
         .map(|player| player.is_paused())
         .unwrap_or(false);
 
-    {
+    // For position 0, always recreate the player to avoid decoder state issues
+    if position > 0.0 {
         let player = state.player.lock().unwrap();
         if let Some(ref player) = *player {
             if player.try_seek(target).is_ok() {
+                state.ended_notified.store(false, Ordering::Relaxed);
                 return Ok(());
             }
         }

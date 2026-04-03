@@ -81,9 +81,9 @@ export class ApiError extends Error {
   }
 }
 
-export function streamUrl(trackUrn: string, format = 'http_mp3_128') {
-  const params = new URLSearchParams({ format });
-  if (useSettingsStore.getState().highQualityStreaming) {
+export function streamUrl(trackUrn: string, hq = useSettingsStore.getState().highQualityStreaming) {
+  const params = new URLSearchParams();
+  if (hq) {
     params.set('hq', 'true');
   }
   if (sessionId) {

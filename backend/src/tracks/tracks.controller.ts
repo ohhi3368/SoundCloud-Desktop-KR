@@ -3,7 +3,6 @@ import {
   Controller,
   Delete,
   Get,
-  Headers,
   HttpStatus,
   Param,
   Post,
@@ -21,6 +20,7 @@ import {
   ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
+import { Cached } from '../cache/cached.decorator.js';
 import { AccessToken } from '../common/decorators/access-token.decorator.js';
 import { SessionId } from '../common/decorators/session-id.decorator.js';
 import { PaginationQuery } from '../common/dto/pagination.dto.js';
@@ -43,6 +43,7 @@ export class TracksController {
   constructor(private readonly tracksService: TracksService) {}
 
   @Get()
+  @Cached({ ttl: 60 })
   @ApiOperation({ summary: 'Search tracks' })
   @ApiQuery({ name: 'q', required: false, description: 'Search query' })
   @ApiQuery({ name: 'ids', required: false, description: 'Comma-separated track IDs' })
@@ -74,6 +75,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn')
+  @Cached({ ttl: 600 })
   @ApiOperation({ summary: 'Get track by URN' })
   @ApiQuery({ name: 'secret_token', required: false })
   @ApiOkResponse({ type: ScTrack })
@@ -106,6 +108,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn/streams')
+  @Cached({ ttl: 3600 })
   @ApiOperation({ summary: 'Get track stream URLs' })
   @ApiQuery({
     name: 'secret_token',
@@ -125,48 +128,28 @@ export class TracksController {
 
   @Get(':trackUrn/stream')
   @ApiOperation({
-    summary: 'Proxy audio stream',
+    summary: 'Get audio stream',
     description:
-      'Proxies the actual audio stream from SoundCloud with proper auth. Use the format query param to pick a transcoding. Supports Range requests for seeking.',
-  })
-  @ApiQuery({
-    name: 'format',
-    required: false,
-    description: 'Stream format: http_mp3_128, hls_mp3_128, hls_aac_160, hls_opus_64',
-    example: 'http_mp3_128',
+      'Returns full audio stream for a track. Backend picks the best available format. With hq=true, prioritizes HQ cookie-based stream.',
   })
   @ApiQuery({ name: 'secret_token', required: false })
   @ApiQuery({
     name: 'hq',
     required: false,
-    description: 'If true, prioritize cookie-based HQ stream before OAuth API',
+    description: 'If true, prioritize HQ stream (cookie-based)',
     example: 'true',
-  })
-  @ApiHeader({
-    name: 'range',
-    required: false,
-    description: 'HTTP Range header for seeking (e.g. bytes=0-999999)',
   })
   async proxyStream(
     @AccessToken() token: string,
     @Res({ passthrough: true }) res: any,
     @Param('trackUrn') trackUrn: string,
-    @Query('format') format: string = 'hls_aac_160',
     @Query('secret_token') secretToken?: string,
     @Query('hq') hq?: string,
-    @Headers('range') range?: string,
   ) {
     const params: Record<string, unknown> = {};
     if (secretToken) params.secret_token = secretToken;
 
-    const result = await this.tracksService.getStreamWithCdn(
-      token,
-      trackUrn,
-      format,
-      params,
-      range,
-      hq === 'true',
-    );
+    const result = await this.tracksService.getStream(token, trackUrn, params, hq === 'true');
 
     if (!result) {
       return {
@@ -184,11 +167,6 @@ export class TracksController {
 
     const { stream, headers } = result;
 
-    res.header('Accept-Ranges', 'bytes');
-    if (headers['content-range']) {
-      res.status(206);
-      res.header('Content-Range', headers['content-range']);
-    }
     return new StreamableFile(stream, {
       type: headers['content-type'],
       length: headers['content-length'] ? Number(headers['content-length']) : undefined,
@@ -196,6 +174,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn/comments')
+  @Cached({ ttl: 10 })
   @ApiOperation({ summary: 'Get track comments' })
   @ApiOkResponse({ type: PaginatedCommentResponse })
   getComments(
@@ -234,6 +213,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn/favoriters')
+  @Cached({ ttl: 600 })
   @ApiOperation({ summary: 'Get users who favorited a track' })
   @ApiOkResponse({ type: PaginatedUserResponse })
   getFavoriters(
@@ -245,6 +225,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn/reposters')
+  @Cached({ ttl: 600 })
   @ApiOperation({ summary: 'Get users who reposted a track' })
   @ApiOkResponse({ type: PaginatedUserResponse })
   getReposters(
@@ -256,6 +237,7 @@ export class TracksController {
   }
 
   @Get(':trackUrn/related')
+  @Cached({ ttl: 86400 })
   @ApiOperation({ summary: 'Get related tracks' })
   @ApiQuery({
     name: 'access',
