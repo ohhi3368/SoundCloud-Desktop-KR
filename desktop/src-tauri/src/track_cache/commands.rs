@@ -1,6 +1,6 @@
 use tauri::State;
 
-use crate::track_cache::state::{download_track_to_cache, TrackCacheState};
+use crate::track_cache::state::{TrackCacheEntry, TrackCacheState};
 
 #[derive(serde::Deserialize)]
 pub struct PreloadEntry {
@@ -15,10 +15,8 @@ pub async fn track_ensure_cached(
     url: String,
     session_id: Option<String>,
     state: State<'_, TrackCacheState>,
-) -> Result<String, String> {
-    state
-        .ensure_cached(&urn, &url, session_id.as_deref())
-        .await
+) -> Result<TrackCacheEntry, String> {
+    state.ensure_cached(&urn, &url, session_id.as_deref()).await
 }
 
 #[tauri::command]
@@ -32,6 +30,14 @@ pub fn track_get_cache_path(urn: String, state: State<'_, TrackCacheState>) -> O
 }
 
 #[tauri::command]
+pub fn track_get_cache_info(
+    urn: String,
+    state: State<'_, TrackCacheState>,
+) -> Option<TrackCacheEntry> {
+    state.get_cache_entry(&urn)
+}
+
+#[tauri::command]
 pub async fn track_preload(
     entries: Vec<PreloadEntry>,
     state: State<'_, TrackCacheState>,
@@ -41,28 +47,21 @@ pub async fn track_preload(
         if state.is_cached(&entry.urn) {
             continue;
         }
+
+        let Some(permit) = state.try_acquire_preload_slot() else {
+            continue;
+        };
+
         queued += 1;
-        let audio_dir = state.audio_dir.clone();
-        let api_client = state.api_client.clone();
-        let storage_head_client = state.storage_head_client.clone();
-        let storage_get_client = state.storage_get_client.clone();
+        let state = state.inner().clone();
         let urn = entry.urn;
         let url = entry.url;
         let session_id = entry.session_id;
 
         tokio::spawn(async move {
+            let _permit = permit;
             println!("[TrackCache] preloading {urn} from {url}");
-            if let Err(err) = download_track_to_cache(
-                &audio_dir,
-                &api_client,
-                &storage_head_client,
-                &storage_get_client,
-                &urn,
-                &url,
-                session_id.as_deref(),
-            )
-            .await
-            {
+            if let Err(err) = state.ensure_cached(&urn, &url, session_id.as_deref()).await {
                 eprintln!("[TrackCache] preload {urn}: {err}");
             }
         });
