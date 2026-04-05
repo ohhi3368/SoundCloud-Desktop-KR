@@ -50,6 +50,7 @@ const LANGUAGES = [
   { code: 'en', label: 'English' },
   { code: 'ru', label: 'Русский' },
   { code: 'tr', label: 'Turkce' },
+  { code: 'ko', label: '한국어' },
 ] as const;
 
 const STARTUP_PAGES: Array<{ id: StartupPage; labelKey: string }> = [
