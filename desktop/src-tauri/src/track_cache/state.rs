@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::error::Error as _;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -94,6 +95,101 @@ fn cache_metadata_path(path: &Path) -> PathBuf {
 
 fn remove_cache_metadata(path: &Path) {
     std::fs::remove_file(cache_metadata_path(path)).ok();
+}
+
+fn truncate_error_text(text: &str, max_chars: usize) -> String {
+    let truncated: String = text.chars().take(max_chars).collect();
+    if text.chars().count() > max_chars {
+        format!("{}...", truncated.trim_end())
+    } else {
+        truncated
+    }
+}
+
+fn extract_json_error(value: &serde_json::Value) -> Option<String> {
+    if let Some(message) = value.get("message").and_then(|v| v.as_str()) {
+        return Some(message.to_string());
+    }
+    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+        return Some(error.to_string());
+    }
+    if let Some(errors) = value.get("errors").and_then(|v| v.as_array()) {
+        let parts = errors
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("error_message")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| entry.get("message").and_then(|v| v.as_str()))
+                    .or_else(|| entry.get("error").and_then(|v| v.as_str()))
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        if !parts.is_empty() {
+            return Some(parts.join("; "));
+        }
+    }
+    None
+}
+
+fn normalize_error_body(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let compact = if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        extract_json_error(&value).unwrap_or_else(|| value.to_string())
+    } else {
+        trimmed.to_string()
+    };
+
+    let single_line = compact.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.is_empty() {
+        None
+    } else {
+        Some(truncate_error_text(&single_line, 220))
+    }
+}
+
+fn format_reqwest_error(err: reqwest::Error) -> String {
+    let mut details = Vec::new();
+    if err.is_timeout() {
+        details.push("timeout".to_string());
+    } else if err.is_connect() {
+        details.push("connect".to_string());
+    } else if err.is_redirect() {
+        details.push("redirect".to_string());
+    } else if err.is_body() {
+        details.push("body".to_string());
+    } else if err.is_decode() {
+        details.push("decode".to_string());
+    } else if err.is_request() {
+        details.push("request".to_string());
+    }
+
+    if let Some(status) = err.status() {
+        details.push(format!("HTTP {status}"));
+    }
+
+    let mut causes = Vec::new();
+    let mut source = err.source();
+    while let Some(next) = source {
+        let text = next.to_string();
+        if !text.is_empty() && !causes.iter().any(|existing| existing == &text) {
+            causes.push(text);
+        }
+        source = next.source();
+    }
+
+    let mut message = err.without_url().to_string();
+    if !details.is_empty() {
+        message.push_str(&format!(" [{}]", details.join(", ")));
+    }
+    if !causes.is_empty() {
+        message.push_str(&format!(": {}", causes.join(": ")));
+    }
+    message
 }
 
 #[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -445,7 +541,11 @@ async fn fetch_target_to_cache(
     }
 
     let response = req.send().await.map_err(|err| {
-        DownloadError::Retryable(format!("{} request: {err}", target.source.label()))
+        DownloadError::Retryable(format!(
+            "{} request: {}",
+            target.source.label(),
+            format_reqwest_error(err)
+        ))
     })?;
     let status = response.status();
 
@@ -461,12 +561,18 @@ async fn fetch_target_to_cache(
         .await;
     }
 
-    let message = format!(
-        "{} HTTP {} from {}",
-        target.source.label(),
-        status,
-        target.url
-    );
+    let body = match response.text().await {
+        Ok(body) => normalize_error_body(&body),
+        Err(err) => Some(format!(
+            "failed to read response body: {}",
+            format_reqwest_error(err)
+        )),
+    };
+    let message = if let Some(body) = body {
+        format!("{} HTTP {}: {}", target.source.label(), status, body)
+    } else {
+        format!("{} HTTP {}", target.source.label(), status)
+    };
     if status.as_u16() == 429 || status.as_u16() >= 500 {
         Err(DownloadError::Retryable(message))
     } else {
