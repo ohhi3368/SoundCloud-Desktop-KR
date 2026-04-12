@@ -235,66 +235,63 @@ impl CookiesClient {
     }
 }
 
-/// Extract sound + clientId from cookie hydration data
-fn extract_cookie_hydration_data(html: &str) -> Option<(CookieHydrationSound, String)> {
-    let marker = "window.__sc_hydration =";
-    let idx = html.find(marker)?;
-    let rest = &html[idx + marker.len()..];
-    let arr_start = rest.find('[')?;
-    let json_start = &rest[arr_start..];
-
-    let mut depth: i32 = 0;
+/// Extract a balanced JSON object starting from '{', handling nested braces and strings.
+fn extract_balanced_json(s: &str) -> Option<&str> {
+    if !s.starts_with('{') {
+        return None;
+    }
+    let mut depth = 0i32;
     let mut in_str = false;
     let mut esc = false;
-    let mut end_idx = 0;
 
-    for (i, ch) in json_start.chars().enumerate() {
+    for (i, ch) in s.char_indices() {
         if !in_str {
             match ch {
-                '"' if !esc => in_str = true,
-                '[' => depth += 1,
-                ']' => {
+                '"' => in_str = true,
+                '{' => depth += 1,
+                '}' => {
                     depth -= 1;
                     if depth == 0 {
-                        end_idx = i + 1;
-                        break;
+                        return Some(&s[..i + 1]);
                     }
                 }
                 _ => {}
             }
-        } else if ch == '"' && !esc {
-            in_str = false;
-        }
-        esc = !esc && ch == '\\';
-    }
-
-    if end_idx == 0 {
-        return None;
-    }
-
-    let entries: Vec<serde_json::Value> = serde_json::from_str(&json_start[..end_idx]).ok()?;
-
-    let mut sound: Option<CookieHydrationSound> = None;
-    let mut client_id: Option<String> = None;
-
-    for entry in entries.iter().rev() {
-        let hydratable = entry.get("hydratable")?.as_str()?;
-        match hydratable {
-            "sound" if sound.is_none() => {
-                sound = entry
-                    .get("data")
-                    .and_then(|d| serde_json::from_value(d.clone()).ok());
+        } else {
+            if ch == '"' && !esc {
+                in_str = false;
             }
-            "apiClient" if client_id.is_none() => {
-                client_id = entry
-                    .get("data")
-                    .and_then(|d| d.get("id"))
-                    .and_then(|id| id.as_str())
-                    .map(|s| s.to_string());
-            }
-            _ => {}
+            esc = !esc && ch == '\\';
         }
     }
+    None
+}
 
-    Some((sound?, client_id?))
+/// Extract sound + clientId from cookie hydration data
+fn extract_cookie_hydration_data(html: &str) -> Option<(CookieHydrationSound, String)> {
+    let client_id_pattern = r#""hydratable"\s*:\s*"apiClient"\s*,\s*"data"\s*:\s*\{\s*"id"\s*:\s*"([^"]+)""#;
+    let client_id_re = regex::Regex::new(client_id_pattern).ok()?;
+    let client_id = client_id_re
+        .captures(html)?
+        .get(1)?
+        .as_str()
+        .to_string();
+
+    let sound_pattern = r#""hydratable"\s*:\s*"sound"\s*,\s*"data"\s*:\s*\{"#;
+    let sound_re = regex::Regex::new(sound_pattern).ok()?;
+    let sound_match = sound_re.find(html)?;
+    // Start from the opening '{' (last char of the match)
+    let sound_start = sound_match.end() - 1;
+    let rest = &html[sound_start..];
+
+    let sound_json = extract_balanced_json(rest)?;
+    let sound: CookieHydrationSound = match serde_json::from_str(sound_json) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("[cookies] sound JSON parse failed: {e}");
+            return None;
+        }
+    };
+
+    Some((sound, client_id))
 }
