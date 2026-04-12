@@ -23,7 +23,10 @@
     "clearQueue": "대기열 비우기",
     "addToQueue": "대기열에 추가",
     "shuffle": "섞기",
-    "repeat": "반복"
+    "repeat": "반복",
+    "qualityHQ": "HQ",
+    "qualitySQ": "SQ",
+    "qualityCDN": "CDN"
   },
   "auth": {
     "signIn": "SoundCloud에 로그인",
@@ -64,7 +67,8 @@
     "hidePanel": "옆 패널 숨기기",
     "showPanel": "옆 패널 표시하기",
     "download": "다운로드",
-    "downloaded": "다운로드를 완료했습니다"
+    "downloaded": "다운로드를 완료했습니다",
+    "loadError": "이 곡을 불러오는 데 문제가 발생했습니다"
   },
   "playlist": {
     "playAll": "모두 재생",
@@ -147,7 +151,9 @@
     "endOfFeed": "모두 확인했어요",
     "recommended": "추천 음악",
     "discover": "둘러보기",
-    "startListening": "감상 시작"
+    "startListening": "감상 시작",
+    "startLikingTitle": "나와 맞는 곡들 — 당신에게 맞는 곡들이 여기 나타날 거에요",
+    "startLikingDesc": "좋아요 한 곡이 많을 수록 당신에게 더 맞는 곡이 나올 거에요"
   },
   "offline": {
     "blockedBadge": "로컬 모드",
@@ -198,7 +204,7 @@
     "bgLoadError": "이미지를 불러오지 못했습니다",
     "unlimited": "무제한",
     "bgOpacity": "배경 어둡기",
-    "bgBlur": "배경 블러",
+    "bgBlur": "배경 흐림",
     "resetDefaults": "기본값으로 재설정",
     "account": "계정",
     "language": "언어",
@@ -215,7 +221,7 @@
     "startup": "시작",
     "startupPageDesc": "앱 실행 시 어떤 페이지를 열지 선택하세요",
     "playback": "재생",
-    "floatingComments": "플로팅 댓글",
+    "floatingComments": "구름 댓글",
     "floatingCommentsDesc": "재생 중 댓글을 떠다니는 말풍선처럼 표시합니다",
     "discordRpc": "Discord Rich Presence",
     "discordRpcDesc": "현재 SoundCloud 재생 상태를 Discord에 표시합니다",
@@ -229,6 +235,8 @@
     "normalizeVolumeDesc": "작은 곡과 큰 곡의 음량을 더 고르게 맞춰줍니다",
     "highQualityStreaming": "고음질 스트리밍",
     "highQualityStreamingDesc": "재생 중 가능한 가장 높은 음질을 우선 사용합니다",
+    "bypassWhitelist": "화이트리스트 우회",
+    "bypassWhitelistDesc": "네트워크 제한 및 장애용 대체 라우팅 (러시아에서 SoundCloud가 차단된 경우 필요할 수 있음)",
     "import": "가져오기",
     "importYandex": "Yandex Music에서 가져오기"
   },
@@ -260,6 +268,7 @@
     "queue": "대기열 전환",
     "lyrics": "가사 전환",
     "sidebar": "사이드바 전환",
+    "fullscreen": "전체화면 전환",
     "close": "닫기",
     "showBindings": "단축키 표시"
   },
@@ -271,10 +280,12 @@
     "tokenPlaceholder": "Yandex Music 토큰을 붙여넣으세요...",
     "start": "가져오기 시작",
     "stop": "중지",
+    "hide": "닫기",
     "found": "찾음",
     "notFound": "찾지 못함",
     "done": "가져오기가 완료되었습니다!",
-    "savingPlaylist": "플레이리스트 저장 중..."
+    "savingPlaylist": "플레이리스트 저장 중...",
+    "backgroundHint": "이 창을 닫아도 뒤에서 가져오기가 계속돼요"
   },
   "update": {
     "available": "새로운 업데이트가 있어요",
@@ -288,9 +299,34 @@
     "seeAll": "모두 보기",
     "cancel": "취소"
   },
+  "star": {
+    "title": "Star 구독하기",
+    "active": "구독 중",
+    "getIt": "자세히 알아보기",
+    "modalTitle": "Star",
+    "modalSub": "이 프로젝트를 후원하고 특별한 혜택을 누리세요",
+    "perkGoPlus": "GO+ 곡들에 접근",
+    "perkServer": "전용 스트리밍 서버",
+    "perkHQ": "더 나은 품질의 곡들",
+    "bypassWhitelist": "화이트리스트 우회 (러시아에서)",
+    "perkSupport": "작은 기부로 프로젝트를 지원해주세요.\n더 많은 혜택이 곧 제공될 예정입니다!",
+    "howTo": "획득 방법",
+    "step1": "Boosty에 접속하세요",
+    "step2": "Discord를 Boosty 계정과 연결하세요",
+    "step3": "우리의 Discord 서버에 가입하세요",
+    "step4": "Boosty에서 구독권을 구매하세요",
+    "step5": "Discord에서 /sc-link 명령어를 사용하여 SoundCloud 계정을 연결하세요",
+    "goBoosty": "Boosty",
+    "goDiscord": "Discord"
+  },
   "news": {
     "dismissOnce": "닫기",
     "dismissForever": "다시 보지 않기",
+    "discord": {
+      "title": "Discord 서버를 열었습니다!",
+      "description": "저희 커뮤니티에 가입해주세요 — 의논, 기능 피드백 제안, 버그 제보 등등 — 함께 해요!",
+      "body": "SoundCloud Desktop 공식 Discord 서버를 오픈했습니다!\n\n저희 커뮤니티에 가입해서 다른 유저들과 소통하고, 버그를 제보하고, 최신 소식들을 접해보세요.\n\nhttps://discord.gg/xQcGBP8fGG"
+    },
     "artistPro": {
       "title": "Artist PRO 구독자",
       "description": "앱이 막히기 더 어려워지도록 도와주세요. Discord로 연락 바랍니다!",
