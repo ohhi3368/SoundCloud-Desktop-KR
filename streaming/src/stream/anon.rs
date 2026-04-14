@@ -98,6 +98,30 @@ impl AnonClient {
         }
     }
 
+    pub async fn resolve_url(
+        &self,
+        url: &str,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error + Send + Sync>> {
+        let client_id = self.get_client_id().await?;
+        let target = build_resolve_target(url, &client_id);
+
+        match proxy_get_json::<serde_json::Value>(
+            &self.client,
+            &self.proxy_url,
+            &target,
+            HashMap::new(),
+        )
+        .await
+        {
+            Ok(track) => Ok(track),
+            Err(_) => {
+                let new_id = self.invalidate_and_refresh().await?;
+                let retry_target = build_resolve_target(url, &new_id);
+                proxy_get_json(&self.client, &self.proxy_url, &retry_target, HashMap::new()).await
+            }
+        }
+    }
+
     pub async fn resolve_transcoding_url(
         &self,
         transcoding_url: &str,
@@ -152,30 +176,115 @@ impl AnonClient {
 
         let transcodings = track.media.as_ref().and_then(|m| m.transcodings.as_ref());
 
+        // If no transcodings — refresh client_id and retry track fetch
         let transcodings = match transcodings {
             Some(t) if !t.is_empty() => t,
             _ => {
-                warn!("[anon] no transcodings for {track_id}");
-                return Ok(None);
+                warn!("[anon] no transcodings for {track_id}, refreshing client_id");
+                self.invalidate_and_refresh().await?;
+                let retry_track = match self.get_track_by_id(track_id).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("[anon] retry get track failed: {e}");
+                        return Ok(None);
+                    }
+                };
+                match retry_track
+                    .media
+                    .as_ref()
+                    .and_then(|m| m.transcodings.as_ref())
+                {
+                    Some(t) if !t.is_empty() => {
+                        // Return immediately from the retry path
+                        return self.stream_from_transcodings(t).await;
+                    }
+                    _ => {
+                        warn!("[anon] still no transcodings for {track_id} after refresh");
+                        return Ok(None);
+                    }
+                }
             }
         };
 
-        let transcoding = match pick_transcoding(transcodings) {
-            Some(t) => t,
-            None => return Ok(None),
-        };
+        match self.stream_from_transcodings(transcodings).await {
+            Ok(Some(r)) => Ok(Some(r)),
+            Ok(None) => Ok(None),
+            Err(e) => {
+                // Stream failed — refresh client_id and retry
+                warn!("[anon] stream failed for {track_id}, refreshing client_id: {e}");
+                self.invalidate_and_refresh().await?;
+                let retry_track = match self.get_track_by_id(track_id).await {
+                    Ok(t) => t,
+                    Err(e2) => {
+                        warn!("[anon] retry get track failed: {e2}");
+                        return Ok(None);
+                    }
+                };
+                match retry_track
+                    .media
+                    .as_ref()
+                    .and_then(|m| m.transcodings.as_ref())
+                {
+                    Some(t) if !t.is_empty() => self.stream_from_transcodings(t).await,
+                    _ => Ok(None),
+                }
+            }
+        }
+    }
 
-        let mime = transcoding
-            .format
-            .as_ref()
-            .and_then(|f| f.mime_type.as_deref())
-            .unwrap_or("audio/mpeg");
+    async fn stream_from_transcodings(
+        &self,
+        transcodings: &[Transcoding],
+    ) -> Result<Option<AnonStreamResult>, Box<dyn std::error::Error + Send + Sync>> {
+        let ranked = ranked_transcodings(transcodings);
+        if ranked.is_empty() {
+            return Ok(None);
+        }
 
-        let m3u8_url = self.resolve_transcoding_url(&transcoding.url, None).await?;
-        let (data, content_type) =
-            download_hls_full(&self.client, &self.proxy_url, &m3u8_url, mime).await?;
+        let mut last_err: Option<Box<dyn std::error::Error + Send + Sync>> = None;
+        for t in ranked {
+            let mime = t
+                .format
+                .as_ref()
+                .and_then(|f| f.mime_type.as_deref())
+                .unwrap_or("audio/mpeg");
 
-        Ok(Some(AnonStreamResult { data, content_type }))
+            let m3u8_url = match self.resolve_transcoding_url(&t.url, None).await {
+                Ok(u) => u,
+                Err(e) => {
+                    warn!(
+                        "[anon] resolve {} failed: {e}",
+                        t.preset.as_deref().unwrap_or("?")
+                    );
+                    last_err = Some(e);
+                    continue;
+                }
+            };
+
+            match download_hls_full(
+                &self.client,
+                &self.proxy_url,
+                &m3u8_url,
+                mime,
+                HashMap::new(),
+            )
+            .await
+            {
+                Ok((data, content_type)) => {
+                    return Ok(Some(AnonStreamResult { data, content_type }))
+                }
+                Err(e) => {
+                    warn!(
+                        "[anon] transcoding {} failed: {e}",
+                        t.preset.as_deref().unwrap_or("?")
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+
+        // All failed — return Err to trigger client_id refresh retry
+        Err(last_err.unwrap_or_else(|| "all anon transcodings failed".into()))
     }
 
     async fn refresh_client_id(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -207,8 +316,8 @@ impl AnonClient {
     }
 }
 
-/// Pick best transcoding: non-encrypted, non-snipped, non-preview
-fn pick_transcoding(transcodings: &[Transcoding]) -> Option<&Transcoding> {
+/// Return all valid transcodings ranked by preset preference.
+fn ranked_transcodings(transcodings: &[Transcoding]) -> Vec<&Transcoding> {
     let candidates: Vec<&Transcoding> = transcodings
         .iter()
         .filter(|t| {
@@ -218,28 +327,32 @@ fn pick_transcoding(transcodings: &[Transcoding]) -> Option<&Transcoding> {
                 .and_then(|f| f.protocol.as_deref())
                 .unwrap_or("")
                 .contains("encrypted");
-            let snipped = t.snipped.unwrap_or(false);
-            let preview = t.url.contains("/preview");
-            !encrypted && !snipped && !preview
+            !encrypted && !t.snipped.unwrap_or(false) && !t.url.contains("/preview")
         })
         .collect();
 
     if candidates.is_empty() {
-        return None;
+        return Vec::new();
     }
 
     const PRESET_ORDER: &[&str] = &["mp3_1_0", "aac_160k", "opus_0_0", "abr_sq"];
 
+    let mut ordered: Vec<&Transcoding> = Vec::with_capacity(candidates.len());
     for preset in PRESET_ORDER {
         if let Some(t) = candidates
             .iter()
             .find(|t| t.preset.as_deref() == Some(preset))
         {
-            return Some(t);
+            ordered.push(t);
         }
     }
-
-    Some(candidates[0])
+    // Append any not matched by preset (by pointer identity)
+    for t in &candidates {
+        if !ordered.iter().any(|o| std::ptr::eq(*o, *t)) {
+            ordered.push(t);
+        }
+    }
+    ordered
 }
 
 /// Extract client_id from window.__sc_hydration on SC homepage
@@ -248,4 +361,12 @@ fn extract_client_id_from_hydration(html: &str) -> Option<String> {
     let re = regex::Regex::new(pattern).ok()?;
     let caps = re.captures(html)?;
     caps.get(1).map(|m| m.as_str().to_string())
+}
+
+fn build_resolve_target(url: &str, client_id: &str) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .append_pair("url", url)
+        .append_pair("client_id", client_id)
+        .finish();
+    format!("{SC_API_V2}/resolve?{query}")
 }

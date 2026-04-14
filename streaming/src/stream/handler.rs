@@ -2,6 +2,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Redirect, Response};
+use axum::Json;
 use bytes::Bytes;
 use tracing::{info, warn};
 
@@ -13,6 +14,24 @@ pub struct StreamQuery {
     pub hq: Option<String>,
     pub session_id: Option<String>,
     pub secret_token: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+pub struct ResolveQuery {
+    pub url: String,
+}
+
+pub async fn resolve_track(
+    State(state): State<AppState>,
+    Query(query): Query<ResolveQuery>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    match state.anon.resolve_url(&query.url).await {
+        Ok(track) => Ok(Json(track)),
+        Err(error) => {
+            warn!("[resolve] {} failed: {error}", query.url);
+            Err(AppError::NotFound)
+        }
+    }
 }
 
 /// GET /stream/:track_urn — normal stream (OAuth → anon)
@@ -38,8 +57,16 @@ pub async fn stream_normal(
         return Ok(Redirect::temporary(&cdn_url).into_response());
     }
 
-    // 2. OAuth → anon
-    if let Some(resp) = try_oauth(&state, &session.access_token, &track_urn, secret_token).await {
+    // 2. OAuth(all) → anon
+    if let Some(resp) = try_oauth(
+        &state,
+        &session.access_token,
+        &track_urn,
+        secret_token,
+        false,
+    )
+    .await
+    {
         info!("[stream] {track_urn} → oauth");
         return respond_with_data(&state, &track_urn, resp.0, resp.1);
     }
@@ -97,14 +124,40 @@ pub async fn stream_premium(
     let tag = "[stream/premium]";
 
     if hq {
-        // HQ mode: cookies → OAuth → anon
-        if let Some(resp) = try_cookies(&state, &track_urn, tag).await {
-            info!("{tag} {track_urn} → cookies");
+        // HQ cascade: cookies(HQ) → oauth(HQ) → oauth(all) → cookies(all) → anon
+        if let Some(resp) = try_cookies(&state, &track_urn, tag, true).await {
+            info!("{tag} {track_urn} → cookies/hq");
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
 
-        if let Some(resp) = try_oauth(&state, &session.access_token, &track_urn, secret_token).await {
-            info!("{tag} {track_urn} → oauth");
+        if let Some(resp) = try_oauth(
+            &state,
+            &session.access_token,
+            &track_urn,
+            secret_token,
+            true,
+        )
+        .await
+        {
+            info!("{tag} {track_urn} → oauth/hq");
+            return respond_with_data(&state, &track_urn, resp.0, resp.1);
+        }
+
+        if let Some(resp) = try_oauth(
+            &state,
+            &session.access_token,
+            &track_urn,
+            secret_token,
+            false,
+        )
+        .await
+        {
+            info!("{tag} {track_urn} → oauth/sq");
+            return respond_with_data(&state, &track_urn, resp.0, resp.1);
+        }
+
+        if let Some(resp) = try_cookies(&state, &track_urn, tag, false).await {
+            info!("{tag} {track_urn} → cookies/sq");
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
 
@@ -113,8 +166,16 @@ pub async fn stream_premium(
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
     } else {
-        // Non-HQ: OAuth → anon → cookies
-        if let Some(resp) = try_oauth(&state, &session.access_token, &track_urn, secret_token).await {
+        // SQ cascade: oauth(all) → anon → cookies(all)
+        if let Some(resp) = try_oauth(
+            &state,
+            &session.access_token,
+            &track_urn,
+            secret_token,
+            false,
+        )
+        .await
+        {
             info!("{tag} {track_urn} → oauth");
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
@@ -124,7 +185,7 @@ pub async fn stream_premium(
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
 
-        if let Some(resp) = try_cookies(&state, &track_urn, tag).await {
+        if let Some(resp) = try_cookies(&state, &track_urn, tag, false).await {
             info!("{tag} {track_urn} → cookies");
             return respond_with_data(&state, &track_urn, resp.0, resp.1);
         }
@@ -141,6 +202,7 @@ async fn try_oauth(
     access_token: &str,
     track_urn: &str,
     secret_token: Option<&str>,
+    hq_only: bool,
 ) -> Option<(Bytes, &'static str)> {
     let result = super::oauth::try_oauth_stream(
         &state.http_client,
@@ -149,14 +211,20 @@ async fn try_oauth(
         access_token,
         track_urn,
         secret_token,
+        hq_only,
     )
     .await?;
     Some((result.data, result.content_type))
 }
 
-async fn try_cookies(state: &AppState, track_urn: &str, tag: &str) -> Option<(Bytes, &'static str)> {
+async fn try_cookies(
+    state: &AppState,
+    track_urn: &str,
+    tag: &str,
+    hq_only: bool,
+) -> Option<(Bytes, &'static str)> {
     let cookies_client = state.cookies.as_ref()?;
-    match cookies_client.get_stream(track_urn).await {
+    match cookies_client.get_stream(track_urn, hq_only).await {
         Ok(Some(result)) => Some((result.data, result.content_type)),
         Ok(None) => {
             warn!("{tag} {track_urn} cookies returned nothing");
