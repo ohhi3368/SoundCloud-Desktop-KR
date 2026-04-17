@@ -35,6 +35,15 @@
     "copyLink": "링크 복사",
     "copied": "복사 완료!"
   },
+    "reauth": {
+    "title": "세션 만료됨",
+    "description": "로그인 세션이 만료됐어요. 다시 로그인해 주세요.",
+    "signIn": "로그인",
+    "signingIn": "로그인 중...",
+    "copyLink": "링크 복사",
+    "copied": "복사 완료!",
+    "logout": "로그아웃"
+  },
   "search": {
     "placeholder": "음악, 플레이리스트 또는 유저를 검색하세요...",
     "tracks": "곡",
