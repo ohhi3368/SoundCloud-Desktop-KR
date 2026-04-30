@@ -35,7 +35,7 @@
     "copyLink": "링크 복사",
     "copied": "복사 완료!"
   },
-    "reauth": {
+  "reauth": {
     "title": "세션 만료됨",
     "description": "로그인 세션이 만료됐어요. 다시 로그인해 주세요.",
     "signIn": "로그인",
@@ -53,7 +53,7 @@
     "hint": "아티스트, 밴드, 곡 또는 팟캐스트 찾기",
     "history": "최근 검색",
     "clearHistory": "기록 비우기"
-    },
+  },
   "track": {
     "comments": "댓글",
     "related": "비슷한 곡들",
@@ -77,7 +77,16 @@
     "showPanel": "옆 패널 표시하기",
     "download": "다운로드",
     "downloaded": "다운로드를 완료했습니다",
-    "loadError": "이 곡을 불러오는 데 문제가 발생했습니다"
+    "loadError": "이 곡을 불러오는 데 문제가 발생했습니다",
+    "manualSearch": "직접 검색",
+    "search": "검색",
+    "resizeLayout": "레이아웃 크기 조절",
+    "viewArtwork": "보기",
+    "selfGenerated": "AI 생성",
+    "dislike": "싫어요",
+    "removeDislike": "싫어요 취소",
+    "play": "재생",
+    "pause": "일시정지"
   },
   "playlist": {
     "playAll": "모두 재생",
@@ -306,7 +315,8 @@
     "error": "문제가 발생했습니다",
     "retry": "다시 시도",
     "seeAll": "모두 보기",
-    "cancel": "취소"
+    "cancel": "취소",
+    "back": "뒤로"
   },
   "star": {
     "title": "Star 구독하기",
@@ -341,5 +351,74 @@
       "description": "앱이 막히기 더 어려워지도록 도와주세요. Discord로 연락 바랍니다!",
       "body": "SoundCloud에서 Artist PRO를 구독 중이라면, 이 프로젝트가 밴을 당하지 않도록 도와주실 수 있어요.\n\nDiscord에서 @nonameex666에게 연락해 주세요. 계정에 연결된 OAuth 앱을 만들어 드릴게요. 로테이션 풀에 앱이 많아질수록 SoundCloud가 우리를 한 번에 모두 밴 하기가 더 어려워집니다.\n\n계정에는 어떤 영향도 없습니다. 이 앱은 API 인증에만 사용됩니다."
     }
+  },
+  "qrLink": {
+    "pullTitle": "다른 기기로 로그인",
+    "pullSubtitle": "이미 로그인된 휴대폰이나 다른 기기에서 SoundCloud Desktop을 열고 이 코드를 스캔하세요.",
+    "pushTitle": "다른 기기 추가",
+    "pushSubtitle": "휴대폰이나 다른 기기에서 SoundCloud Desktop을 열고 이 코드를 스캔해 그 기기에 로그인하세요.",
+    "preparing": "보안 코드 생성 중...",
+    "expiresIn": "{{seconds}}초 후 만료",
+    "pullSuccess": "로그인되었습니다.",
+    "pushSuccess": "다른 기기가 로그인되었습니다.",
+    "failed": "QR 연결에 실패했습니다.",
+    "retry": "새 코드 생성",
+    "scanQr": "QR로 로그인",
+    "transferSession": "다른 기기로 세션 전송"
+  },
+  "soundwave": {
+    "tagline": "당신만을 위한 개인 라디오",
+    "playAll": "모두 재생",
+    "refresh": "새로고침",
+    "languages": "언어",
+    "allLanguages": "모든 언어",
+    "langShort": "언어",
+    "clear": "지우기",
+    "idleTitle": "재생을 눌러 웨이브를 타보세요",
+    "idleSub": "다음 곡은 좋아하실 만한 트랙입니다",
+    "coldTitle": "아직 웨이브를 준비 중입니다",
+    "coldDesc": "몇 곡을 좋아요하면 취향에 맞춰 라디오를 조정할게요",
+    "forYou": "추천",
+    "searchPlaceholder": "분위기를 설명하세요. 예: \"비 오는 날의 슬픈 피아노\"",
+    "searchAction": "검색",
+    "searchClear": "지우기",
+    "searchReset": "웨이브로 돌아가기",
+    "searchResultsFor": "\"{{q}}\" 검색 결과",
+    "searchResultsCount_one": "{{count}}곡",
+    "searchResultsCount_other": "{{count}}곡",
+    "searchEmptyTitle": "이 분위기에 맞는 결과가 없습니다",
+    "searchEmptyDesc": "기분, 악기, 장면처럼 다른 단어로 검색해 보세요",
+    "modeTitle": "비슷하게 또는 다양하게",
+    "modeSimilar": "비슷하게",
+    "modeDiverse": "다양하게",
+    "similarity": "유사도",
+    "diverse": "다양함",
+    "similar": "이 곡과 비슷하게",
+    "similarDesc": "이 트랙의 사운드와 분위기에 맞춘 추천",
+    "similarEmpty": "비슷한 트랙을 찾기에는 아직 데이터가 부족합니다",
+    "similarCold": "이 트랙이 AI로 인덱싱되면 개인 추천이 여기에 표시됩니다",
+    "hideLikedLabel": "좋아요한 곡 숨기기",
+    "hideLikedOn": "좋아요한 트랙은 웨이브에서 제외됩니다",
+    "hideLikedOff": "이미 좋아요한 트랙을 제외하려면 켜세요"
+  },
+  "cache": {
+    "bulkCache": "모두 캐시",
+    "cancel": "취소",
+    "allCached": "모든 트랙이 이미 캐시되어 있습니다",
+    "bulkSuccess_one": "{{count}}곡을 캐시했습니다",
+    "bulkSuccess_other": "{{count}}곡을 캐시했습니다",
+    "bulkFailed_one": "{{count}}곡 캐시에 실패했습니다",
+    "bulkFailed_other": "{{count}}곡 캐시에 실패했습니다"
+  },
+  "soundwaveLock": {
+    "wordmark": "SOUND WAVE",
+    "badge": "Star 전용",
+    "title": "구독자만 이용할 수 있습니다",
+    "subtitle": "SoundWave 무료 공개까지",
+    "cta": "구독하기",
+    "days": "일",
+    "hours": "시간",
+    "minutes": "분",
+    "seconds": "초"
   }
 }
