@@ -20,6 +20,7 @@ import {
   Disc3 as _Disc3,
   Download as _Download,
   ExternalLink as _ExternalLink,
+  Eye as _Eye,
   Fullscreen as _Fullscreen,
   Globe as _Globe,
   GripVertical as _GripVertical,
@@ -54,12 +55,14 @@ import {
   Send as _Send,
   Settings as _Settings,
   Shuffle as _Shuffle,
+  Smartphone as _Smartphone,
   SkipBack as _SkipBack,
   SkipForward as _SkipForward,
   SlidersHorizontal as _SlidersHorizontal,
   Sparkles as _Sparkles,
-  Star as _Star,
   Square as _Square,
+  Star as _Star,
+  ThumbsDown as _ThumbsDown,
   Trash2 as _Trash2,
   User as _User,
   Users as _Users,
@@ -102,6 +105,7 @@ export const Clock = memo(_Clock);
 export const Compass = memo(_Compass);
 export const Disc3 = memo(_Disc3);
 export const ExternalLink = memo(_ExternalLink);
+export const Eye = memo(_Eye);
 export const Fullscreen = memo(_Fullscreen);
 export const Globe = memo(_Globe);
 export const GripVertical = memo(_GripVertical);
@@ -136,11 +140,13 @@ export const Search = memo(_Search);
 export const Send = memo(_Send);
 export const Settings = memo(_Settings);
 export const Shuffle = memo(_Shuffle);
+export const Smartphone = memo(_Smartphone);
 export const SkipBack = memo(_SkipBack);
 export const SkipForward = memo(_SkipForward);
 export const Sparkles = memo(_Sparkles);
 export const Star = memo(_Star);
 export const Square = memo(_Square);
+export const ThumbsDown = memo(_ThumbsDown);
 export const Trash2 = memo(_Trash2);
 export const Twitter = memo(({ size, className }: { size?: number; className?: string }) => (
   <SimpleIcon icon={siX} size={size} className={className} />

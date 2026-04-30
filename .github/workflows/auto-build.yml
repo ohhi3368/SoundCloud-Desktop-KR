@@ -83,6 +83,19 @@ jobs:
         with:
           ref: main
 
+      # GPU-образ воркера съедает ~20 GB (CUDA base + torch CUDA wheels + bitsandbytes).
+      # Стандартный runner даёт ~14 GB free — без этого шага падает на ENOSPC.
+      - name: Free disk space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: true
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          swap-storage: false
+          docker-images: false
+
       - uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
@@ -111,6 +124,8 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: streaming
+          build-contexts: |
+            tls-common=tls-common
           push: true
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/streaming:${{ needs.version.outputs.version }}
@@ -122,12 +137,43 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: storage
+          build-contexts: |
+            tls-common=tls-common
           push: true
           tags: |
             ghcr.io/${{ steps.repo.outputs.name }}/storage:${{ needs.version.outputs.version }}
             ghcr.io/${{ steps.repo.outputs.name }}/storage:latest
           cache-from: type=gha,scope=storage
           cache-to: type=gha,mode=max,scope=storage
+
+      # Оба воркера держат кэш в GHCR registry (вне лимита 10 GB GHA cache):
+      # CPU тянет torch+transformers+huggingface_hub (~1.5 GB), GPU — ещё CUDA wheels (~5 GB).
+      # Кэш живёт как отдельные теги worker:cache-cpu / worker:cache-gpu.
+      - name: Build & push worker (CPU)
+        uses: docker/build-push-action@v6
+        with:
+          context: worker
+          file: worker/Dockerfile
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:${{ needs.version.outputs.version }}
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:latest
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:${{ needs.version.outputs.version }}-cpu
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:cpu
+          cache-from: type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}/worker:cache-cpu
+          cache-to: type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}/worker:cache-cpu,mode=max,image-manifest=true,oci-mediatypes=true
+
+      - name: Build & push worker (GPU / CUDA)
+        uses: docker/build-push-action@v6
+        with:
+          context: worker
+          file: worker/Dockerfile.gpu
+          push: true
+          tags: |
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:${{ needs.version.outputs.version }}-gpu
+            ghcr.io/${{ steps.repo.outputs.name }}/worker:gpu
+          cache-from: type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}/worker:cache-gpu
+          cache-to: type=registry,ref=ghcr.io/${{ steps.repo.outputs.name }}/worker:cache-gpu,mode=max,image-manifest=true,oci-mediatypes=true
 
   build:
     needs: version

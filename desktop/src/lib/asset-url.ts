@@ -1,6 +1,7 @@
 import { useSettingsStore } from '../stores/settings';
 import { BYPASS_IMAGES_BASE, getProxyPort, IMAGES_BASE } from './constants';
 import { getIsPremium } from './premium-cache';
+import { isMac } from './platform';
 
 const WHITELIST = [
   'localhost',
@@ -57,7 +58,7 @@ export function toScproxyUrl(url: string, { bypassCache = false } = {}): string 
   const encodedPath = encodeURIComponent(btoa(JSON.stringify([target, ...upstreams])));
 
   const proxyPort = getProxyPort();
-  if (proxyPort) {
+  if (proxyPort && !isMac()) {
     const shard = hashShard(target);
     return `http://scproxy-${shard}.localhost:${proxyPort}/p/${encodedPath}`;
   }

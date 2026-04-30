@@ -38,15 +38,9 @@ export class Session {
   @Column({ nullable: true })
   username: string;
 
-  @Column({ nullable: true })
-  codeVerifier: string;
-
-  @Column({ nullable: true })
-  state: string;
-
   /** ID OAuth-аппки, через которую была авторизация */
   @Column({ nullable: true })
-  oauthAppId: string;
+  oauthAppId?: string;
 
   @CreateDateColumn()
   createdAt: Date;
