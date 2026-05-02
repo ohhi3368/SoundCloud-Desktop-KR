@@ -41,6 +41,18 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
     await this.ensureStream(STREAMS.aiRpc.name, [...STREAMS.aiRpc.subjects], true, 120);
     await this.ensureStream(STREAMS.indexAudio.name, [...STREAMS.indexAudio.subjects], true);
     await this.ensureStream(STREAMS.embedLyrics.name, [...STREAMS.embedLyrics.subjects], true);
+    await this.ensureStream(
+      STREAMS.trainCollab.name,
+      [...STREAMS.trainCollab.subjects],
+      true,
+      6 * 60 * 60,
+    );
+    await this.ensureStream(
+      STREAMS.trainLtr.name,
+      [...STREAMS.trainLtr.subjects],
+      true,
+      24 * 60 * 60,
+    );
     await this.ensureStream(STREAMS.done.name, [...STREAMS.done.subjects], false);
     await this.ensureStream(STREAMS.storageEvents.name, [...STREAMS.storageEvents.subjects], false);
   }
@@ -171,7 +183,10 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
             const info = m.info;
             try {
               const data = JSON.parse(decoder.decode(m.data));
-              await handler(data, { streamSeq: info.streamSequence, deliveries: info.deliveryCount });
+              await handler(data, {
+                streamSeq: info.streamSequence,
+                deliveries: info.deliveryCount,
+              });
               m.ack();
             } catch (e) {
               this.logger.error(`consume ${stream}/${durable}: ${(e as Error).message}`);
@@ -179,7 +194,9 @@ export class NatsService implements OnModuleInit, OnModuleDestroy {
             }
           }
         } catch (e) {
-          this.logger.warn(`consume loop ${stream}/${durable} broke: ${(e as Error).message} — retry in 2s`);
+          this.logger.warn(
+            `consume loop ${stream}/${durable} broke: ${(e as Error).message} — retry in 2s`,
+          );
           await new Promise((r) => setTimeout(r, 2000));
         }
       }

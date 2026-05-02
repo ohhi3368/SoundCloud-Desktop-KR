@@ -247,6 +247,14 @@
     "total": "Total",
     "audioCacheSize": "Audio",
     "assetsCacheSize": "Images & assets",
+    "likedCacheSize": "Likes (protected cache)",
+    "cacheLikes": "Cache liked tracks",
+    "cacheLikesDesc": "Downloads all likes into a separate folder that bypasses the audio cache limit.",
+    "cacheLikesStarting": "Preparing...",
+    "cacheLikesProgress": "{{done}} of {{total}}",
+    "cacheLikesFailed": "failed: {{count}}",
+    "cacheLikesDone": "Done: {{done}} of {{total}}",
+    "cacheLikesEmpty": "No liked tracks",
     "audioCacheLimit": "Audio cache limit",
     "audioCacheLimitDesc": "Older cached tracks are deleted automatically when the limit is exceeded",
     "clearCache": "Clear",
@@ -357,15 +365,6 @@
     "seeAll": "See All",
     "cancel": "Cancel",
     "back": "Back"
-  },
-  "cache": {
-    "bulkCache": "Cache all",
-    "cancel": "Cancel",
-    "allCached": "All tracks are already cached",
-    "bulkSuccess_one": "Cached {{count}} track",
-    "bulkSuccess_other": "Cached {{count}} tracks",
-    "bulkFailed_one": "Failed to cache {{count}} track",
-    "bulkFailed_other": "Failed to cache {{count}} tracks"
   },
   "star": {
     "title": "Star Subscription",

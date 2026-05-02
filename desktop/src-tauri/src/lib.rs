@@ -47,9 +47,16 @@ pub fn run() {
                 .path()
                 .app_cache_dir()
                 .expect("failed to resolve app cache dir");
+            let data_dir = app
+                .path()
+                .app_data_dir()
+                .expect("failed to resolve app data dir");
 
             let audio_dir = cache_dir.join("audio");
             std::fs::create_dir_all(&audio_dir).ok();
+
+            let liked_audio_dir = cache_dir.join("audio_liked");
+            std::fs::create_dir_all(&liked_audio_dir).ok();
 
             let assets_dir = cache_dir.join("assets");
             std::fs::create_dir_all(&assets_dir).ok();
@@ -57,13 +64,24 @@ pub fn run() {
             let wallpapers_dir = cache_dir.join("wallpapers");
             std::fs::create_dir_all(&wallpapers_dir).ok();
 
+            let images_dir = data_dir.join("images");
+            std::fs::create_dir_all(&images_dir).ok();
+
+            let http_client = reqwest::Client::new();
             let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
 
             network::proxy::STATE
                 .set(network::proxy::State {
                     assets_dir,
-                    http_client: reqwest::Client::new(),
+                    http_client: http_client.clone(),
                     rt_handle: rt.handle().clone(),
+                })
+                .ok();
+
+            network::image_cache::STATE
+                .set(network::image_cache::ImageCache {
+                    dir: images_dir,
+                    http_client,
                 })
                 .ok();
 
@@ -83,7 +101,7 @@ pub fn run() {
                 client: Mutex::new(None),
             }));
 
-            let mut track_cache_state = track_cache::init(audio_dir);
+            let mut track_cache_state = track_cache::init(audio_dir, liked_audio_dir);
             track_cache_state.app_handle = Some(app.handle().clone());
             app.manage(track_cache_state);
 
@@ -140,9 +158,16 @@ pub fn run() {
             track_cache::track_get_cache_info,
             track_cache::track_preload,
             track_cache::track_cache_size,
+            track_cache::track_liked_cache_size,
             track_cache::track_clear_cache,
+            track_cache::track_clear_liked_cache,
             track_cache::track_list_cached,
             track_cache::track_enforce_cache_limit,
+            track_cache::track_cache_likes,
+            track_cache::track_cache_likes_running,
+            track_cache::track_cancel_cache_likes,
+            network::image_cache::image_cache_size,
+            network::image_cache::image_cache_clear,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

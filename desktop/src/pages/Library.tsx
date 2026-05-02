@@ -2,7 +2,6 @@ import React, { useCallback, useDeferredValue, useEffect, useMemo, useState } fr
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { AddToPlaylistDialog } from '../components/music/AddToPlaylistDialog';
-import { BulkDownloadButton } from '../components/music/BulkDownloadButton';
 import { LikeButton } from '../components/music/LikeButton';
 import { PlaylistCard } from '../components/music/PlaylistCard';
 import { VirtualGrid } from '../components/ui/VirtualGrid';
@@ -232,16 +231,38 @@ const LibraryHero = React.memo(function LibraryHero({
     e.stopPropagation();
     if (shuffleLoading) return;
 
-    setShuffleLoading(true);
-    try {
-      const all = await fetchAllLikedTracks();
-      if (all.length === 0) return;
+    if (!usePlayerStore.getState().shuffle) {
+      usePlayerStore.setState({ shuffle: true });
+    }
 
-      if (!usePlayerStore.getState().shuffle) {
-        usePlayerStore.setState({ shuffle: true });
-      }
-      const random = all[Math.floor(Math.random() * all.length)];
-      usePlayerStore.getState().play(random, all);
+    const seen = new Set<string>();
+    let started = false;
+
+    // Мгновенный старт с уже загруженных треков (первая страница useLikedTracks)
+    if (likedTracks.length > 0) {
+      for (const t of likedTracks) seen.add(t.urn);
+      const random = likedTracks[Math.floor(Math.random() * likedTracks.length)];
+      usePlayerStore.getState().play(random, likedTracks);
+      started = true;
+    } else {
+      setShuffleLoading(true);
+    }
+
+    try {
+      await fetchAllLikedTracks(200, (page) => {
+        const fresh = page.filter((t) => !seen.has(t.urn));
+        for (const t of fresh) seen.add(t.urn);
+        if (fresh.length === 0) return;
+
+        if (!started) {
+          const random = fresh[Math.floor(Math.random() * fresh.length)];
+          usePlayerStore.getState().play(random, fresh);
+          started = true;
+          setShuffleLoading(false);
+        } else {
+          usePlayerStore.getState().addToQueue(fresh);
+        }
+      });
     } finally {
       setShuffleLoading(false);
     }
@@ -369,24 +390,16 @@ const LikesTab = React.memo(function LikesTab({ filter }: { filter: string }) {
   }, [likedTracks, filter]);
 
   const expandQueue = React.useCallback(() => {
-    fetchAllLikedTracks().then((all) => {
-      usePlayerStore.getState().setQueue(all);
-    });
+    const seen = new Set<string>(usePlayerStore.getState().queue.map((t) => t.urn));
+    fetchAllLikedTracks(200, (page) => {
+      const fresh = page.filter((t) => !seen.has(t.urn));
+      for (const t of fresh) seen.add(t.urn);
+      if (fresh.length > 0) usePlayerStore.getState().addToQueue(fresh);
+    }).catch(() => {});
   }, []);
-
-  const getAllLikesForDownload = React.useCallback(() => fetchAllLikedTracks(), []);
 
   return (
     <div className="min-h-[400px]">
-      {likedTracks.length > 0 && (
-        <div className="flex justify-end mb-3">
-          <BulkDownloadButton
-            cacheKey="likes"
-            getTracks={getAllLikesForDownload}
-            variant="compact"
-          />
-        </div>
-      )}
       <div className="flex flex-col gap-1">
         {isLoading ? (
           <div className="flex justify-center py-20">

@@ -227,6 +227,14 @@
     "total": "Toplam",
     "audioCacheSize": "Ses",
     "assetsCacheSize": "Gorseller ve varliklar",
+    "likedCacheSize": "Begeniler (korumali onbellek)",
+    "cacheLikes": "Begenileri onbellege al",
+    "cacheLikesDesc": "Tum begenileri ses onbellek limitini atlayan ayri bir klasore indirir.",
+    "cacheLikesStarting": "Hazirlaniyor...",
+    "cacheLikesProgress": "{{done}} / {{total}}",
+    "cacheLikesFailed": "basarisiz: {{count}}",
+    "cacheLikesDone": "Tamam: {{done}} / {{total}}",
+    "cacheLikesEmpty": "Begenilen parca yok",
     "audioCacheLimit": "Ses onbellek limiti",
     "audioCacheLimitDesc": "Limit asildiginda eski onbelleklenmis parcilar otomatik silinir",
     "clearCache": "Temizle",
@@ -337,15 +345,6 @@
     "seeAll": "Tumunu Gor",
     "cancel": "Iptal",
     "back": "Geri"
-  },
-  "cache": {
-    "bulkCache": "Onbellege al",
-    "cancel": "Iptal",
-    "allCached": "Tum parcalar zaten onbellekte",
-    "bulkSuccess_one": "{{count}} parca onbellege alindi",
-    "bulkSuccess_other": "{{count}} parca onbellege alindi",
-    "bulkFailed_one": "{{count}} parca onbellege alinamadi",
-    "bulkFailed_other": "{{count}} parca onbellege alinamadi"
   },
   "star": {
     "title": "Star Abonelik",
