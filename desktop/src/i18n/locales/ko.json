@@ -26,7 +26,16 @@
     "repeat": "반복",
     "qualityHQ": "HQ",
     "qualitySQ": "SQ",
-    "qualityCDN": "CDN"
+    "qualityCDN": "CDN",
+    "playbackSpeed": "배속",
+    "playbackSpeedReset": "1.00배속으로 초기화",
+    "soundTuning": "사운드 튜닝",
+    "pitch": "피치",
+    "pitchReset": "피치 초기화",
+    "pitchModeAuto": "피치가 배속을 따라갑니다",
+    "pitchModeAutoShort": "자동",
+    "pitchModeManual": "수동으로 피치를 조절합니다",
+    "pitchModeManualShort": "수동"
   },
   "auth": {
     "signIn": "SoundCloud에 로그인",
@@ -86,7 +95,8 @@
     "dislike": "싫어요",
     "removeDislike": "싫어요 취소",
     "play": "재생",
-    "pause": "일시정지"
+    "pause": "일시정지",
+    "openTrackPage": "트랙 페이지 열기"
   },
   "playlist": {
     "playAll": "모두 재생",
@@ -207,6 +217,14 @@
     "total": "전체",
     "audioCacheSize": "오디오",
     "assetsCacheSize": "이미지 및 에셋",
+    "likedCacheSize": "좋아요 (보호된 캐시)",
+    "cacheLikes": "좋아요 한 곡 캐시",
+    "cacheLikesDesc": "모든 좋아요 한 곡을 오디오 캐시 제한을 우회하는 별도의 폴더에 다운로드합니다.",
+    "cacheLikesStarting": "준비 중...",
+    "cacheLikesProgress": "{{total}} 중 {{done}}",
+    "cacheLikesFailed": "실패: {{count}}",
+    "cacheLikesDone": "완료: {{total}} 중 {{done}}",
+    "cacheLikesEmpty": "좋아요 한 곡 없음",
     "audioCacheLimit": "오디오 캐시 한도",
     "audioCacheLimitDesc": "한도를 초과하면 오래된 캐시 곡이 자동으로 삭제됩니다",
     "clearCache": "비우기",
@@ -241,6 +259,8 @@
     "playback": "재생",
     "floatingComments": "구름 댓글",
     "floatingCommentsDesc": "재생 중 댓글을 떠다니는 말풍선처럼 표시합니다",
+    "lyricsVisualizer": "가사 시각화",
+    "lyricsVisualizerDesc": "전체화면 가사 뒤에 실시간 FFT 웨이브를 표시합니다. GPU 절약을 위해 기본적으로 꺼져 있습니다.",
     "discordRpc": "Discord Rich Presence",
     "discordRpcDesc": "현재 SoundCloud 재생 상태를 Discord에 표시합니다",
     "discordRpcMode": "표시 모드",
