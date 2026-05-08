@@ -42,7 +42,15 @@
     "signingIn": "로그인 대기 중...",
     "signOut": "로그아웃",
     "copyLink": "링크 복사",
-    "copied": "복사 완료!"
+    "copied": "복사 완료!",
+    "stepWaiting": "SoundCloud 인증 대기 중",
+    "stepToken": "인증 코드 교환 중",
+    "stepProfile": "프로필 정보 가져오는 중",
+    "stepSession": "세션 마무리 중",
+    "tagline": "당신만의 음악, 당신만의 방식",
+    "orSeparator": "또는",
+    "continueOffline": "로그인 없이 계속",
+    "continueOfflineDesc": "로컬 라이브러리에서 다운로드한 트랙과 좋아요한 곡 듣기"
   },
   "reauth": {
     "title": "세션 만료됨",
@@ -209,7 +217,9 @@
     "notCached": "저장되지 않음",
     "pendingCount": "{{count}}개 대기 중",
     "failedCount": "{{count}}개 실패",
-    "syncNow": "지금 동기화"
+    "syncNow": "지금 동기화",
+    "searchPlaceholder": "제목이나 아티스트로 검색",
+    "searchEmpty": "검색 결과가 없습니다"
   },
   "settings": {
     "title": "설정",
@@ -440,5 +450,17 @@
     "hours": "시간",
     "minutes": "분",
     "seconds": "초"
+  },
+  "call": {
+    "title": "피어 네트워크",
+    "enable": "활성화",
+    "disable": "비활성화",
+    "status": {
+      "disabled": "꺼짐",
+      "connecting": "연결 중",
+      "provisioning": "등록 중",
+      "active": "활성",
+      "failed": "실패"
+    }
   }
 }
