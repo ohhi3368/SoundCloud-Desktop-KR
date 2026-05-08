@@ -16,12 +16,13 @@ src-tauri/target/
 streaming/target
 storage/target
 tls-common/target
-backend/gateway/target
+backend/target
 
 storage/data
 streaming/data
 
-backend/snapshots
+# CI checkout slot for sibling repos.
+/_internal
 
 # IDE
 .idea/

@@ -42,7 +42,15 @@
     "signingIn": "Ожидание авторизации...",
     "signOut": "Выйти",
     "copyLink": "Скопировать ссылку",
-    "copied": "Скопировано!"
+    "copied": "Скопировано!",
+    "stepWaiting": "Ожидание авторизации в SoundCloud",
+    "stepToken": "Обмен кода авторизации",
+    "stepProfile": "Получение профиля",
+    "stepSession": "Завершение сессии",
+    "tagline": "Твоя музыка — твои правила",
+    "orSeparator": "или",
+    "continueOffline": "Продолжить без входа",
+    "continueOfflineDesc": "Слушай скачанные треки и лайки прямо из локальной медиатеки"
   },
   "reauth": {
     "title": "Сессия истекла",
@@ -255,7 +263,9 @@
     "failedCount_one": "{{count}} ошибка",
     "failedCount_few": "{{count}} ошибки",
     "failedCount_many": "{{count}} ошибок",
-    "syncNow": "Синхронизировать"
+    "syncNow": "Синхронизировать",
+    "searchPlaceholder": "Поиск по названию или артисту",
+    "searchEmpty": "Ничего не нашлось"
   },
   "settings": {
     "title": "Настройки",
@@ -422,6 +432,18 @@
       "title": "У нас появился Discord!",
       "description": "Присоединяйся — обсуждения, предложения, баг-репорты",
       "body": "Мы запустили официальный Discord-сервер SoundCloud Desktop!\n\nЗаходи, чтобы общаться с другими пользователями, предлагать фичи, сообщать о багах и быть в курсе последних новостей.\n\nhttps://discord.gg/xQcGBP8fGG"
+    }
+  },
+  "call": {
+    "title": "Сеть пользователей",
+    "enable": "Включить",
+    "disable": "Выключить",
+    "status": {
+      "disabled": "выкл",
+      "connecting": "подключение",
+      "provisioning": "регистрация",
+      "active": "активен",
+      "failed": "ошибка"
     }
   }
 }
