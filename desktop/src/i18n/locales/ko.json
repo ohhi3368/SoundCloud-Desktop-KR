@@ -2,6 +2,7 @@
   "nav": {
     "home": "홈",
     "search": "검색",
+    "discover": "둘러보기",
     "library": "라이브러리",
     "offline": "오프라인",
     "following": "팔로우 중인 유저",
@@ -52,10 +53,12 @@
     "continueOffline": "로그인 없이 계속",
     "continueOfflineDesc": "로컬 라이브러리에서 다운로드한 트랙과 좋아요한 곡 듣기"
   },
-  "reauth": {
-    "title": "세션 만료됨",
-    "description": "로그인 세션이 만료됐어요. 다시 로그인해 주세요.",
-    "signIn": "로그인",
+  "recovery": {
+    "title": "세션 중단됨",
+    "description": "자동으로 세션을 갱신할 수 없었어요. 다시 시도하거나 다시 로그인해 주세요.",
+    "retry": "다시 시도",
+    "renewing": "세션 갱신 중...",
+    "signIn": "다시 로그인",
     "signingIn": "로그인 중...",
     "copyLink": "링크 복사",
     "copied": "복사 완료!",
@@ -79,6 +82,17 @@
     "likes": "좋아요",
     "reposts": "리포스트",
     "posted": "업로드 날짜",
+    "uploadedBy": "<1>{{name}}</1> 님이 업로드함",
+    "verifiedArtist": "인증된 아티스트 (신뢰도 {{confidence}})",
+    "unverifiedArtist": "제목에서 추출됨, 외부 인증 안 됨 (신뢰도 {{confidence}})",
+    "uploadKind": {
+      "original": "오리지널",
+      "demo": "데모",
+      "alt": "얼터너티브",
+      "reupload": "재업로드"
+    },
+    "notFoundOnSc": "SoundCloud에서 찾을 수 없음",
+    "wantedHint": "알려진 트랙이지만 아직 업로드되지 않음",
     "description": "설명",
     "noComments": "아직 댓글이 없네요",
     "postComment": "게시",
@@ -148,7 +162,10 @@
     "publicProfile": "다른사람한테는 당신의 모습이 이렇게 보여요",
     "about": "소개",
     "memberSince": "가입일자",
-    "links": "다른 링크"
+    "links": "다른 링크",
+    "verifiedArtist": "인증된 아티스트",
+    "auraTitle": "아우라",
+    "auraCustom": "사용자 지정"
   },
   "library": {
     "likedTracks": "좋아요 한 곡",
@@ -219,7 +236,8 @@
     "failedCount": "{{count}}개 실패",
     "syncNow": "지금 동기화",
     "searchPlaceholder": "제목이나 아티스트로 검색",
-    "searchEmpty": "검색 결과가 없습니다"
+    "searchEmpty": "검색 결과가 없습니다",
+    "removeCached": "캐시에서 제거"
   },
   "settings": {
     "title": "설정",
@@ -346,7 +364,10 @@
     "retry": "다시 시도",
     "seeAll": "모두 보기",
     "cancel": "취소",
-    "back": "뒤로"
+    "back": "뒤로",
+    "empty": "아직 아무것도 없네요",
+    "expand": "더 보기",
+    "collapse": "접기"
   },
   "star": {
     "title": "Star 구독하기",
@@ -408,7 +429,6 @@
     "idleSub": "다음 곡은 좋아하실 만한 트랙입니다",
     "coldTitle": "아직 웨이브를 준비 중입니다",
     "coldDesc": "몇 곡을 좋아요하면 취향에 맞춰 라디오를 조정할게요",
-    "forYou": "추천",
     "searchPlaceholder": "분위기를 설명하세요. 예: \"비 오는 날의 슬픈 피아노\"",
     "searchAction": "검색",
     "searchClear": "지우기",
@@ -418,18 +438,44 @@
     "searchResultsCount_other": "{{count}}곡",
     "searchEmptyTitle": "이 분위기에 맞는 결과가 없습니다",
     "searchEmptyDesc": "기분, 악기, 장면처럼 다른 단어로 검색해 보세요",
-    "modeTitle": "비슷하게 또는 다양하게",
-    "modeSimilar": "비슷하게",
-    "modeDiverse": "다양하게",
-    "similarity": "유사도",
-    "diverse": "다양함",
-    "similar": "이 곡과 비슷하게",
-    "similarDesc": "이 트랙의 사운드와 분위기에 맞춘 추천",
-    "similarEmpty": "비슷한 트랙을 찾기에는 아직 데이터가 부족합니다",
-    "similarCold": "이 트랙이 AI로 인덱싱되면 개인 추천이 여기에 표시됩니다",
     "hideLikedLabel": "좋아요한 곡 숨기기",
     "hideLikedOn": "좋아요한 트랙은 웨이브에서 제외됩니다",
-    "hideLikedOff": "이미 좋아요한 트랙을 제외하려면 켜세요"
+    "hideLikedOff": "이미 좋아요한 트랙을 제외하려면 켜세요",
+    "home": {
+      "waveTitle": "웨이브",
+      "waveDesc": "취향에 맞춰 끝없이 이어지는 믹스 — 추천, 주변 아티스트, 최신 발매곡.",
+      "cluster": {
+        "for_you": "추천",
+        "for_youDesc": "당신의 취향에 가장 잘 맞는 추천.",
+        "top_artists": "가장 좋아하는 아티스트",
+        "top_artistsDesc": "자주 듣는 아티스트들의 신곡 하나씩.",
+        "adjacent": "인접한 아티스트",
+        "adjacentDesc": "좋아하는 아티스트와 함께 자주 재생되는 아티스트.",
+        "fresh_drops": "최신 발매곡",
+        "fresh_dropsDesc": "팔로우하는 아티스트의 최신 트랙.",
+        "same_vibe": "비슷한 분위기",
+        "same_vibeDesc": "당신의 감성에 맞는 사운드.",
+        "deep_cuts": "조금 더 깊이",
+        "deep_cutsDesc": "취향에는 맞지만 잘 알려지지 않은 트랙."
+      }
+    },
+    "similar": {
+      "title": "이 곡과 비슷하게",
+      "desc": "사운드가 비슷하고 같은 청취자들이 자주 듣는 곡.",
+      "playAll": "재생",
+      "empty": "아직 아무것도 없네요",
+      "emptyDesc": "비슷한 트랙을 찾지 못했어요 — 나중에 다시 시도해 보세요.",
+      "cluster": {
+        "same_artist": "이 아티스트",
+        "same_artistDesc": "같은 아티스트의 다른 트랙.",
+        "same_vibe": "비슷한 분위기",
+        "same_vibeDesc": "다른 아티스트의 비슷한 사운드.",
+        "featured_with": "피처링",
+        "featured_withDesc": "피처링으로 함께한 아티스트들.",
+        "fans_also": "팬들이 자주 듣는 곡",
+        "fans_alsoDesc": "이 곡의 청취자들이 자주 듣는 다른 트랙."
+      }
+    }
   },
   "cache": {
     "bulkCache": "모두 캐시",
@@ -462,5 +508,110 @@
       "active": "활성",
       "failed": "실패"
     }
+  },
+  "artist": {
+    "title": "아티스트",
+    "tracks": "트랙",
+    "appearsOn": "참여한 앨범",
+    "albums": "앨범",
+    "related": "관련 아티스트",
+    "about": "소개",
+    "aboutTitle": "소개",
+    "noTracks": "트랙 없음",
+    "noAppearances": "참여 앨범 없음",
+    "noAlbums": "아직 앨범 없음",
+    "noRelated": "아직 관련 아티스트 없음",
+    "noBio": "아직 소개글 없음",
+    "scAccounts": "SoundCloud 계정",
+    "mainAccount": "메인",
+    "demoAccount": "데모",
+    "wave": {
+      "title": "사운드 웨이브",
+      "desc": "{{name}}을 중심으로 그리드를 만들었습니다: 그들의 트랙과 함께 재생된 트랙들.",
+      "playAll": "웨이브 재생",
+      "pause": "일시정지",
+      "empty": "웨이브가 비어 있습니다",
+      "emptyDesc": "이 아티스트의 카탈로그가 더 많이 분석되면 웨이브가 채워질 것입니다.",
+      "cluster": {
+        "essence": "에센스",
+        "essenceDesc": "이 아티스트에게서 가장 많이 재생되는 곡.",
+        "vibe": "비슷한 분위기",
+        "vibeDesc": "비슷한 감성을 가진 다른 아티스트들의 트랙.",
+        "neighbors": "인접한 아티스트",
+        "neighborsDesc": "함께 재생된 아티스트들 — 각각 하나의 트랙.",
+        "deep": "조금 더 깊이",
+        "deepDesc": "잘 알려지지 않은 다양한 추천 곡들 — 스스로 찾기 어려운 곡들."
+      }
+    },
+    "sortPopular": "인기순",
+    "sortRecent": "최신순",
+    "viewList": "리스트",
+    "viewYears": "연도별",
+    "comingSoon": "출시 예정",
+    "country": "국가",
+    "confidence": "신뢰도",
+    "links": "링크",
+    "featured": "피처링",
+    "affinity": "친밀도",
+    "releaseYear": "발매일",
+    "unknownYear": "연도 미상",
+    "statsTracks": "트랙",
+    "statsFeatured": "피처링",
+    "statsAlbums": "앨범",
+    "statsRelated": "관련 아티스트",
+    "kind": {
+      "album": "앨범",
+      "ep": "EP",
+      "single": "싱글",
+      "compilation": "컴필레이션"
+    }
+  },
+  "album": {
+    "playAlbum": "앨범 재생",
+    "pauseAlbum": "앨범 일시정지",
+    "tracks": "트랙",
+    "tracksCount_one": "{{count}}곡",
+    "tracksCount_other": "{{count}}곡",
+    "cast": "참여진",
+    "primaryArtist": "메인 아티스트",
+    "featured": "피처링",
+    "remixer": "리믹서",
+    "producer": "프로듀서",
+    "availability": "{{indexed}}/{{total}}곡 가능",
+    "verified": "인증됨",
+    "noTracks": "아직 색인된 트랙 없음",
+    "comingSoon": "출시 예정"
+  },
+  "discover": {
+    "title": "둘러보기",
+    "surpriseMe": "새로운 추천",
+    "statArtists": "아티스트",
+    "statAlbums": "앨범",
+    "statFresh": "신곡",
+    "metaArtists_one": "{{count}}명 아티스트",
+    "metaArtists_other": "{{count}}명 아티스트",
+    "metaAlbums_one": "{{count}}장 앨범",
+    "metaAlbums_other": "{{count}}장 앨범",
+    "metaFresh_one": "{{count}}개의 신곡",
+    "metaFresh_other": "{{count}}개의 신곡",
+    "spotlightTitle": "스포트라이트",
+    "tabAlbums": "앨범",
+    "tabArtists": "아티스트",
+    "allKinds": "전체",
+    "allTags": "모든 태그",
+    "sortRecent": "최신순",
+    "sortPopular": "인기순",
+    "sortAz": "A → Z",
+    "sortTracks": "트랙순",
+    "sortTrending": "트렌딩",
+    "sortListeners": "청취자순",
+    "sortStar": "스타 우선",
+    "searchPlaceholder": "제목이나 아티스트로 필터",
+    "trendValue": "↑ {{value}}",
+    "noAlbums": "앨범 없음",
+    "noArtists": "아티스트 없음",
+    "noMatches": "“{{query}}”에 대한 결과가 없습니다",
+    "capAlbums": "최고의 인기 앨범들입니다 — 장르를 좁히거나 검색하여 더 깊이 탐색해 보세요.",
+    "capArtists": "최고의 인기 아티스트들입니다 — 태그를 선택하거나 검색하여 더 깊이 탐색해 보세요."
   }
 }
