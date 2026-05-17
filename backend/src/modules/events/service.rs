@@ -16,7 +16,6 @@ use crate::modules::indexing::IndexingService;
 use crate::modules::user_taste::UserTasteService;
 
 const LIKE_WEIGHT: f64 = 1.0;
-const LOCAL_LIKE_WEIGHT: f64 = 1.0;
 const PLAYLIST_ADD_WEIGHT: f64 = 0.9;
 const FULL_PLAY_WEIGHT: f64 = 0.3;
 const SKIP_WEIGHT: f64 = -0.5;
@@ -25,18 +24,56 @@ const DISLIKE_WEIGHT: f64 = -1.0;
 const USER_LOCK_CAPACITY: u64 = 16_384;
 const USER_LOCK_TTL: Duration = Duration::from_secs(5 * 60);
 
-const POSITIVE_EVENTS: &[&str] = &["like", "local_like", "playlist_add"];
-const COLLAB_TRIGGER_EVENTS: &[&str] = &["like", "local_like", "playlist_add", "full_play", "skip"];
+const POSITIVE_EVENTS: &[&str] = &["like", "playlist_add"];
+const COLLAB_TRIGGER_EVENTS: &[&str] = &["like", "playlist_add", "full_play", "skip"];
 
 fn event_weight(event_type: &str) -> Option<f64> {
     match event_type {
         "like" => Some(LIKE_WEIGHT),
-        "local_like" => Some(LOCAL_LIKE_WEIGHT),
         "playlist_add" => Some(PLAYLIST_ADD_WEIGHT),
         "full_play" => Some(FULL_PLAY_WEIGHT),
         "skip" => Some(SKIP_WEIGHT),
         "dislike" => Some(DISLIKE_WEIGHT),
         _ => None,
+    }
+}
+
+async fn log_hard_negative_inline(
+    pg: &PgPool,
+    sc_user_id: &str,
+    sc_track_id: &str,
+    position_pct: f32,
+) -> Result<(), sqlx::Error> {
+    let predicted: Option<f32> = sqlx::query_scalar(
+        "SELECT score FROM rec_impressions
+         WHERE sc_user_id = $1 AND sc_track_id = $2
+         ORDER BY shown_at DESC LIMIT 1",
+    )
+    .bind(sc_user_id)
+    .bind(sc_track_id)
+    .fetch_optional(pg)
+    .await?
+    .flatten();
+    let predicted = predicted.unwrap_or(0.0);
+    sqlx::query(
+        "INSERT INTO rec_hard_negatives (sc_user_id, sc_track_id, predicted_score, position_pct)
+         VALUES ($1, $2, $3, $4)",
+    )
+    .bind(sc_user_id)
+    .bind(sc_track_id)
+    .bind(predicted)
+    .bind(position_pct)
+    .execute(pg)
+    .await?;
+    Ok(())
+}
+
+fn skip_weight_from_position(position_pct: Option<f32>) -> f64 {
+    match position_pct {
+        Some(p) if p < 0.20 => -0.8,
+        Some(p) if p < 0.70 => -0.3,
+        Some(_) => 0.0,
+        None => SKIP_WEIGHT,
     }
 }
 
@@ -146,8 +183,9 @@ impl EventsService {
         sc_user_id: &str,
         sc_track_id: &str,
         event_type: &str,
+        position_pct: Option<f32>,
     ) -> AppResult<()> {
-        let Some(weight) = event_weight(event_type) else {
+        let Some(mut weight) = event_weight(event_type) else {
             warn!(event_type, "Unknown event type");
             return Ok(());
         };
@@ -156,18 +194,35 @@ impl EventsService {
             return Ok(());
         };
 
+        if event_type == "skip" {
+            weight = skip_weight_from_position(position_pct);
+            if let Some(p) = position_pct {
+                if p < 0.20 {
+                    let pg = self.pg.clone();
+                    let user = sc_user_id.to_string();
+                    let id = normalized.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = log_hard_negative_inline(&pg, &user, &id, p).await {
+                            warn!(error = %e, "hard_negative insert failed");
+                        }
+                    });
+                }
+            }
+        }
+
         let lock_key = format!("events:{sc_user_id}");
         let lock = self.lock_for(&lock_key);
         let _g = lock.lock().await;
 
         let event: UserEventRow = sqlx::query_as(
-            "INSERT INTO user_events (sc_user_id, sc_track_id, event_type, weight, seeded) \
-             VALUES ($1, $2, $3, $4, false) RETURNING id, sc_user_id, sc_track_id, event_type",
+            "INSERT INTO user_events (sc_user_id, sc_track_id, event_type, weight, position_pct, seeded) \
+             VALUES ($1, $2, $3, $4, $5, false) RETURNING id, sc_user_id, sc_track_id, event_type",
         )
         .bind(sc_user_id)
         .bind(&normalized)
         .bind(event_type)
         .bind(weight)
+        .bind(position_pct)
         .fetch_one(&self.pg)
         .await?;
 

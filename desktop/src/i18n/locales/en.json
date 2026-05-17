@@ -2,6 +2,7 @@
   "nav": {
     "home": "Home",
     "search": "Search",
+    "discover": "Discover",
     "library": "Library",
     "offline": "Offline",
     "following": "Following",
@@ -52,10 +53,12 @@
     "continueOffline": "Continue without signing in",
     "continueOfflineDesc": "Listen to downloaded tracks and likes from your local library"
   },
-  "reauth": {
-    "title": "Session Expired",
-    "description": "Your session has expired. Sign in to continue.",
-    "signIn": "Sign In",
+  "recovery": {
+    "title": "Session Interrupted",
+    "description": "We couldn't refresh your session automatically. Retry, or sign in again.",
+    "retry": "Try again",
+    "renewing": "Renewing session...",
+    "signIn": "Sign in again",
     "signingIn": "Signing in...",
     "copyLink": "Copy link",
     "copied": "Copied!",
@@ -93,6 +96,17 @@
     "likes": "likes",
     "reposts": "reposts",
     "posted": "Posted",
+    "uploadedBy": "uploaded by <1>{{name}}</1>",
+    "verifiedArtist": "Verified artist (confidence {{confidence}})",
+    "unverifiedArtist": "Parsed from title, not externally verified (confidence {{confidence}})",
+    "uploadKind": {
+      "original": "original",
+      "demo": "demo",
+      "alt": "alt",
+      "reupload": "re-upload"
+    },
+    "notFoundOnSc": "not found on SoundCloud",
+    "wantedHint": "Track is known but not uploaded yet",
     "description": "Description",
     "noComments": "No comments yet",
     "postComment": "Post",
@@ -162,7 +176,10 @@
     "publicProfile": "This is how your public profile looks to others",
     "about": "About",
     "memberSince": "Member since",
-    "links": "Links"
+    "links": "Links",
+    "verifiedArtist": "Verified Artist",
+    "auraTitle": "Aura",
+    "auraCustom": "Custom"
   },
   "library": {
     "likedTracks": "Liked Tracks",
@@ -217,7 +234,6 @@
     "idleSub": "Up next — a track we think you'll love",
     "coldTitle": "Your wave is still warming up",
     "coldDesc": "Like a few tracks and we'll tune this radio to your taste",
-    "forYou": "For you",
     "searchPlaceholder": "Describe a vibe — e.g. \"sad piano in the rain\"",
     "searchAction": "Search",
     "searchClear": "Clear",
@@ -227,18 +243,44 @@
     "searchResultsCount_other": "{{count}} tracks",
     "searchEmptyTitle": "Nothing matched that vibe",
     "searchEmptyDesc": "Try different words — moods, instruments or a scene",
-    "modeTitle": "Similar vs. diverse",
-    "modeSimilar": "Similar",
-    "modeDiverse": "Diverse",
-    "similarity": "Similar",
-    "diverse": "Diverse",
-    "similar": "More like this",
-    "similarDesc": "Picks tuned to this track's sound and mood",
-    "similarEmpty": "Not enough data yet to find similar tracks",
-    "similarCold": "Once this track is indexed by AI, you'll see personal picks here",
     "hideLikedLabel": "Hide liked",
     "hideLikedOn": "Liked tracks are excluded from the wave",
-    "hideLikedOff": "Turn on to exclude tracks you've already liked"
+    "hideLikedOff": "Turn on to exclude tracks you've already liked",
+    "home": {
+      "waveTitle": "Wave",
+      "waveDesc": "Infinite mix from your taste graph — picks, neighbours, fresh drops, anti-skips.",
+      "cluster": {
+        "for_you": "For you",
+        "for_youDesc": "Best matches for your taste.",
+        "top_artists": "Your favourites",
+        "top_artistsDesc": "Artists you play most — one fresh track from each.",
+        "adjacent": "Adjacent worlds",
+        "adjacentDesc": "Artists played alongside the ones you love.",
+        "fresh_drops": "Fresh drops",
+        "fresh_dropsDesc": "Recent additions from artists you follow.",
+        "same_vibe": "Same vibe",
+        "same_vibeDesc": "Sound in your emotional spectrum.",
+        "deep_cuts": "Deeper",
+        "deep_cutsDesc": "Off the beaten path — but in your key."
+      }
+    },
+    "similar": {
+      "title": "More like this",
+      "desc": "Close in sound and shared by the same listeners.",
+      "playAll": "Play",
+      "empty": "Nothing yet",
+      "emptyDesc": "No similar tracks found — try again later.",
+      "cluster": {
+        "same_artist": "This artist",
+        "same_artistDesc": "Other tracks in the same key.",
+        "same_vibe": "Same vibe",
+        "same_vibeDesc": "Close sound from other artists.",
+        "featured_with": "Featured with",
+        "featured_withDesc": "Artists who crossed paths on features.",
+        "fans_also": "Listeners also play",
+        "fans_alsoDesc": "What fans of this track also listen to."
+      }
+    }
   },
   "offline": {
     "offlineBadge": "No network",
@@ -259,7 +301,8 @@
     "failedCount": "{{count}} failed",
     "syncNow": "Sync now",
     "searchPlaceholder": "Search by title or artist",
-    "searchEmpty": "Nothing matches your search"
+    "searchEmpty": "Nothing matches your search",
+    "removeCached": "Remove from cache"
   },
   "settings": {
     "title": "Settings",
@@ -386,7 +429,10 @@
     "retry": "Retry",
     "seeAll": "See All",
     "cancel": "Cancel",
-    "back": "Back"
+    "back": "Back",
+    "empty": "Nothing here yet",
+    "expand": "Read more",
+    "collapse": "Collapse"
   },
   "star": {
     "title": "Star Subscription",
@@ -439,5 +485,110 @@
       "active": "active",
       "failed": "failed"
     }
+  },
+  "artist": {
+    "title": "Artist",
+    "tracks": "Tracks",
+    "appearsOn": "Appears on",
+    "albums": "Albums",
+    "related": "Related",
+    "about": "About",
+    "aboutTitle": "About",
+    "noTracks": "No tracks",
+    "noAppearances": "No appearances",
+    "noAlbums": "No albums yet",
+    "noRelated": "No related artists yet",
+    "noBio": "No bio yet",
+    "scAccounts": "SoundCloud accounts",
+    "mainAccount": "Main",
+    "demoAccount": "Demo",
+    "wave": {
+      "title": "Sound Wave",
+      "desc": "We built a grid around {{name}}: their tracks and the ones played alongside.",
+      "playAll": "Play wave",
+      "pause": "Pause",
+      "empty": "The wave is empty",
+      "emptyDesc": "When more of this artist's catalogue gets analysed, the grid will start to hum.",
+      "cluster": {
+        "essence": "Essence",
+        "essenceDesc": "What gets played the most from this artist.",
+        "vibe": "Same vibe",
+        "vibeDesc": "Tracks by other artists in the same emotional spectrum.",
+        "neighbors": "Adjacent worlds",
+        "neighborsDesc": "Artists played alongside — one track from each.",
+        "deep": "Deeper",
+        "deepDesc": "Diverse picks beyond the horizon — songs you wouldn't surface on your own."
+      }
+    },
+    "sortPopular": "Popular",
+    "sortRecent": "Recent",
+    "viewList": "List",
+    "viewYears": "By year",
+    "comingSoon": "Coming soon",
+    "country": "Country",
+    "confidence": "Confidence",
+    "links": "Links",
+    "featured": "Featured",
+    "affinity": "Affinity",
+    "releaseYear": "Released",
+    "unknownYear": "Undated",
+    "statsTracks": "Tracks",
+    "statsFeatured": "Featured",
+    "statsAlbums": "Albums",
+    "statsRelated": "Related",
+    "kind": {
+      "album": "Album",
+      "ep": "EP",
+      "single": "Single",
+      "compilation": "Compilation"
+    }
+  },
+  "album": {
+    "playAlbum": "Play Album",
+    "pauseAlbum": "Pause Album",
+    "tracks": "Tracks",
+    "tracksCount_one": "{{count}} track",
+    "tracksCount_other": "{{count}} tracks",
+    "cast": "Cast",
+    "primaryArtist": "Primary",
+    "featured": "Featured",
+    "remixer": "Remixer",
+    "producer": "Producer",
+    "availability": "{{indexed}}/{{total}} available",
+    "verified": "Verified",
+    "noTracks": "No tracks indexed yet",
+    "comingSoon": "Coming soon"
+  },
+  "discover": {
+    "title": "Discover",
+    "surpriseMe": "Surprise me",
+    "statArtists": "Artists",
+    "statAlbums": "Albums",
+    "statFresh": "New",
+    "metaArtists_one": "{{count}} artist",
+    "metaArtists_other": "{{count}} artists",
+    "metaAlbums_one": "{{count}} album",
+    "metaAlbums_other": "{{count}} albums",
+    "metaFresh_one": "{{count}} new",
+    "metaFresh_other": "{{count}} new",
+    "spotlightTitle": "Spotlight",
+    "tabAlbums": "Albums",
+    "tabArtists": "Artists",
+    "allKinds": "All",
+    "allTags": "All tags",
+    "sortRecent": "Recent",
+    "sortPopular": "Popular",
+    "sortAz": "A → Z",
+    "sortTracks": "Tracks",
+    "sortTrending": "Trending",
+    "sortListeners": "Listeners",
+    "sortStar": "Stars first",
+    "searchPlaceholder": "Filter by title or artist",
+    "trendValue": "↑ {{value}}",
+    "noAlbums": "No albums",
+    "noArtists": "No artists",
+    "noMatches": "Nothing matches “{{query}}”",
+    "capAlbums": "That's the cream of the crop — narrow the genre or search to dig deeper.",
+    "capArtists": "That's the cream of the crop — pick a tag or search to dig deeper."
   }
 }

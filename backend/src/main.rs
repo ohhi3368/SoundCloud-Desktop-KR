@@ -25,16 +25,21 @@ use tracing::{error, info, warn};
 use crate::bus::nats::NatsService;
 use crate::cache::{CacheService, ListCacheService};
 use crate::config::AppConfig;
+use crate::modules::auras::AurasService;
 use crate::modules::auth::{AuthService, LinkService};
 use crate::modules::centroids::CentroidService;
+use crate::modules::cold_refresh::ColdRefreshService;
 use crate::modules::collab::{CollabTrainerService, CollabVectorService};
+use crate::modules::discover::DiscoverService;
 use crate::modules::dislikes::DislikesService;
+use crate::modules::enrich::{
+    AiResolverClient, ArtistCrawlService, EnrichService, MbClient, TokenPool,
+};
 use crate::modules::events::EventsService;
 use crate::modules::featured::FeaturedService;
 use crate::modules::history::HistoryService;
 use crate::modules::indexing::IndexingService;
 use crate::modules::likes::LikesService;
-use crate::modules::local_likes::LocalLikesService;
 use crate::modules::ltr::{LtrService, LtrTrainerService};
 use crate::modules::lyrics::genius::GeniusService;
 use crate::modules::lyrics::lrclib::LrclibService;
@@ -43,12 +48,11 @@ use crate::modules::lyrics::netease::NeteaseService;
 use crate::modules::lyrics::{LyricsService, WorkerClient};
 use crate::modules::me::MeService;
 use crate::modules::oauth_apps::OAuthAppsService;
-use crate::modules::pending_actions::PendingActionsService;
 use crate::modules::playlists::PlaylistsService;
 use crate::modules::recommendations::{RecommendationsService, S3VerifierService};
-use crate::modules::reposts::RepostsService;
 use crate::modules::resolve::ResolveService;
 use crate::modules::subscriptions::SubscriptionsService;
+use crate::modules::sync_queue::SyncQueueService;
 use crate::modules::tracks::TracksService;
 use crate::modules::transcode::TranscodeTriggerService;
 use crate::modules::user_taste::UserTasteService;
@@ -103,10 +107,16 @@ async fn main() {
 
     let sc = ScClient::new(&config.soundcloud).expect("Failed to build SC HTTP client");
 
-    let sc = match build_call_relay("backend").await {
+    let relay_client = build_call_relay("backend").await;
+    let sc = match relay_client.clone() {
         Some(r) => sc.with_relay(r),
         None => sc,
     };
+    let external_fetcher = crate::common::external_fetch::ExternalFetcher::new(
+        http_client.clone(),
+        config.soundcloud.proxy_url.clone(),
+        relay_client.clone(),
+    );
 
     let oauth_apps = OAuthAppsService::new(pg.clone(), config.clone());
     if let Err(e) = oauth_apps.migrate_env_app().await {
@@ -117,12 +127,18 @@ async fn main() {
         Err(e) => warn!(error = %e, "Failed to count active OAuth apps"),
     }
 
-    let auth = AuthService::new(pg.clone(), sc.clone(), oauth_apps.clone(), config.clone());
+    let auth_health = crate::modules::auth::AuthHealthService::new(redis_pool.clone());
+    let auth = AuthService::new(
+        pg.clone(),
+        sc.clone(),
+        oauth_apps.clone(),
+        config.clone(),
+        auth_health,
+    );
     let link = LinkService::new(pg.clone(), auth.clone());
 
     let cache = CacheService::new(redis_pool.clone());
     let list_cache = ListCacheService::new(redis_pool.clone());
-    let local_likes = LocalLikesService::new(pg.clone());
     let events = EventsService::new(pg.clone());
     let subscriptions = SubscriptionsService::new(
         pg.clone(),
@@ -133,42 +149,59 @@ async fn main() {
         warn!(error = %e, "subscriptions restore failed");
     }
     subscriptions.spawn_snapshot_loop(shutdown.clone());
+    let auras = AurasService::new(pg.clone(), subscriptions.clone());
+    let sync_queue =
+        SyncQueueService::new(pg.clone(), sc.clone(), auth.clone(), redis_pool.clone());
+    let cold_refresh =
+        ColdRefreshService::new(sc.clone(), pg.clone(), cache.clone(), config.cold.clone());
+    cold_refresh.clone().spawn_evict_loop(shutdown.clone());
     let me = MeService::new(
         sc.clone(),
+        pg.clone(),
         list_cache.clone(),
-        local_likes.clone(),
+        sync_queue.clone(),
+        cold_refresh.clone(),
         events.clone(),
     );
-    let pending_actions =
-        PendingActionsService::new(pg.clone(), sc.clone(), auth.clone(), oauth_apps.clone());
     let tracks = TracksService::new(
         sc.clone(),
+        pg.clone(),
         list_cache.clone(),
-        local_likes.clone(),
-        pending_actions.clone(),
+        sync_queue.clone(),
+        cold_refresh.clone(),
     );
-    let playlists = PlaylistsService::new(sc.clone(), list_cache.clone(), pending_actions.clone());
-    let users = UsersService::new(sc.clone(), list_cache.clone(), local_likes.clone());
+    let playlists = PlaylistsService::new(
+        sc.clone(),
+        pg.clone(),
+        list_cache.clone(),
+        sync_queue.clone(),
+        cold_refresh.clone(),
+    );
+    let users = UsersService::new(
+        sc.clone(),
+        pg.clone(),
+        list_cache.clone(),
+        cold_refresh.clone(),
+    );
     let dislikes = DislikesService::new(pg.clone(), events.clone());
-    let likes = LikesService::new(sc.clone(), local_likes.clone(), pending_actions.clone());
-    let reposts = RepostsService::new(sc.clone(), pending_actions.clone());
+    let likes = LikesService::new(pg.clone(), sync_queue.clone());
     let resolve = ResolveService::new(sc.clone(), pg.clone());
     let history = HistoryService::new(pg.clone());
-    let featured = FeaturedService::new(pg.clone(), sc.clone(), auth.clone(), local_likes.clone());
+    let featured = FeaturedService::new(pg.clone(), sc.clone(), auth.clone());
     let centroids = CentroidService::new(qdrant.clone());
     let user_taste = UserTasteService::new(qdrant.clone());
     let transcode = TranscodeTriggerService::new(http_client.clone(), config.clone(), nats.clone());
     let worker = WorkerClient::new(nats.clone());
-    let lrclib = LrclibService::new(http_client.clone());
-    let mxm = MusixmatchService::new(http_client.clone(), config.mxm.api_base.clone());
-    let genius = GeniusService::new(http_client.clone());
-    let netease = NeteaseService::new(http_client.clone(), config.netease.api_base.clone());
+    let lrclib = LrclibService::new(external_fetcher.clone());
+    let mxm = MusixmatchService::new(external_fetcher.clone(), config.mxm.api_base.clone());
+    let genius = GeniusService::new(external_fetcher.clone(), config.genius.clone());
+    let netease = NeteaseService::new(external_fetcher.clone(), config.netease.api_base.clone());
     let lyrics = LyricsService::new(
         pg.clone(),
         nats.clone(),
         lrclib,
         mxm,
-        genius,
+        genius.clone(),
         netease,
         worker.clone(),
         transcode.clone(),
@@ -203,6 +236,78 @@ async fn main() {
         IndexingService::new(pg.clone(), nats.clone(), lyrics.clone(), transcode.clone());
     indexing.spawn(shutdown.clone());
 
+    let mb = MbClient::new(
+        external_fetcher.clone(),
+        config.enrich.mb_user_agent.clone(),
+        config.enrich.mb_rate_limit_ms,
+    );
+    let ai_resolver = if config.enrich.ai_enabled {
+        Some(AiResolverClient::new(
+            nats.clone(),
+            redis_pool.clone(),
+            config.enrich.ai_timeout_ms,
+            config.enrich.ai_daily_budget,
+        ))
+    } else {
+        None
+    };
+    let enrich = EnrichService::new(
+        pg.clone(),
+        nats.clone(),
+        mb.clone(),
+        genius.clone(),
+        ai_resolver,
+        config.enrich.clone(),
+    );
+    enrich.spawn(shutdown.clone());
+
+    let token_pool = Arc::new(TokenPool::new(pg.clone()));
+    let artist_crawl = ArtistCrawlService::new(
+        pg.clone(),
+        mb,
+        genius.clone(),
+        sc.clone(),
+        token_pool.clone(),
+        resolve.clone(),
+        config.enrich_crawl.clone(),
+    );
+    artist_crawl.spawn(shutdown.clone());
+
+    let ai_matcher = if config.enrich.ai_enabled {
+        Some(crate::modules::enrich::ai_matcher::AiMatcherClient::new(
+            nats.clone(),
+            redis_pool.clone(),
+            config.enrich.ai_timeout_ms,
+            config.enrich.ai_daily_budget,
+        ))
+    } else {
+        None
+    };
+
+    let sc_account_scanner = crate::modules::enrich::sc_account_scan::ScAccountScanner::new(
+        pg.clone(),
+        sc.clone(),
+        token_pool.clone(),
+        indexing.clone(),
+        ai_matcher.clone(),
+    );
+
+    let wanted_resolver = crate::modules::enrich::WantedResolverService::new(
+        pg.clone(),
+        sc.clone(),
+        token_pool.clone(),
+        indexing.clone(),
+        sc_account_scanner.clone(),
+        ai_matcher.clone(),
+        &config.enrich_crawl,
+    );
+    wanted_resolver.spawn(shutdown.clone());
+    let wanted_resolver_state = wanted_resolver.clone();
+
+    let discover = DiscoverService::new(pg.clone(), cache.clone(), subscriptions.clone());
+    discover.clone().spawn_refresh_loop(shutdown.clone());
+    enrich.install_followup(artist_crawl.clone(), wanted_resolver.clone());
+
     let track_discovery =
         crate::modules::indexing::TrackDiscoveryService::new(sc.clone(), indexing.clone());
     sc.install_track_observer(track_discovery.clone());
@@ -229,20 +334,28 @@ async fn main() {
     );
     events.spawn_indexing_queue_consumer(nats.clone());
 
+    crate::modules::recommendations::cron::spawn_cron_loops(
+        recommendations.clone(),
+        nats.clone(),
+        qdrant.clone(),
+        pg.clone(),
+        shutdown.clone(),
+    );
+
     let mut tasks = JoinSet::new();
 
     {
         let token = shutdown.clone();
-        let pa = pending_actions.clone();
+        let sq = sync_queue.clone();
         tasks.spawn(async move {
             run_periodic(
-                "pending_actions.sync_all",
+                "sync_queue.flush",
                 token,
                 BG_TICK,
                 BG_WORK_TIMEOUT,
                 move || {
-                    let pa = pa.clone();
-                    async move { pa.sync_all().await.map(|_| ()) }
+                    let sq = sq.clone();
+                    async move { sq.flush().await.map(|_| ()) }
                 },
             )
             .await;
@@ -294,17 +407,15 @@ async fn main() {
         auth,
         link,
         oauth_apps,
-        local_likes,
         events,
         dislikes,
         subscriptions,
+        auras,
         me,
-        pending_actions,
         tracks,
         playlists,
         users,
         likes,
-        reposts,
         resolve,
         history,
         featured,
@@ -314,6 +425,11 @@ async fn main() {
         ltr_trainer,
         indexing,
         recommendations,
+        enrich,
+        artist_crawl: artist_crawl.clone(),
+        wanted_resolver: wanted_resolver_state,
+        discover,
+        sync_queue: sync_queue.clone(),
     };
 
     let app = router::build(state);

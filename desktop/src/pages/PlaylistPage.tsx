@@ -17,6 +17,7 @@ import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { useShallow } from 'zustand/shallow';
 import { LikeButton } from '../components/music/LikeButton';
+import { TrackTitleArtist } from '../components/music/TrackTitleArtist';
 import { VirtualList } from '../components/ui/VirtualList';
 import { api } from '../lib/api';
 import { preloadTrack } from '../lib/audio';
@@ -52,6 +53,7 @@ import {
   Trash2,
   X,
 } from '../lib/icons';
+import { useAutoHide } from '../lib/useAutoHide';
 import { useTrackPlay } from '../lib/useTrackPlay';
 import { useAuthStore } from '../stores/auth';
 import { type Track, usePlayerStore } from '../stores/player';
@@ -172,7 +174,6 @@ const SortableTrackRow = React.memo(
     isOwner: boolean;
     onRemove?: (urn: string) => void;
   }) {
-    const navigate = useNavigate();
     const { t } = useTranslation();
     const { isThis, isThisPlaying, togglePlay } = useTrackPlay(track, queue);
     const cover = art(track.artwork_url, 't200x200');
@@ -243,22 +244,7 @@ const SortableTrackRow = React.memo(
           )}
         </div>
 
-        <div className="flex-1 min-w-0">
-          <p
-            className={`text-[13px] font-medium truncate cursor-pointer transition-colors duration-150 ${
-              isThis ? 'text-accent' : 'text-white/85 hover:text-white'
-            }`}
-            onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
-          >
-            {track.title}
-          </p>
-          <p
-            className="text-[11px] text-white/30 truncate mt-0.5 cursor-pointer hover:text-white/50 transition-colors duration-150"
-            onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-          >
-            {track.user.username}
-          </p>
-        </div>
+        <TrackTitleArtist track={track} highlight={isThis} size="sm" />
 
         <div className="hidden sm:flex items-center gap-3 shrink-0">
           {track.playback_count != null && (
@@ -302,7 +288,6 @@ const SortableTrackRow = React.memo(
 
 const TrackRow = React.memo(
   function TrackRow({ track, index, queue }: { track: Track; index: number; queue: Track[] }) {
-    const navigate = useNavigate();
     const { isThis, isThisPlaying, togglePlay } = useTrackPlay(track, queue);
     const cover = art(track.artwork_url, 't200x200');
 
@@ -350,22 +335,7 @@ const TrackRow = React.memo(
           )}
         </div>
 
-        <div className="flex-1 min-w-0">
-          <p
-            className={`text-[13px] font-medium truncate cursor-pointer transition-colors duration-150 ${
-              isThis ? 'text-accent' : 'text-white/85 hover:text-white'
-            }`}
-            onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
-          >
-            {track.title}
-          </p>
-          <p
-            className="text-[11px] text-white/30 truncate mt-0.5 cursor-pointer hover:text-white/50 transition-colors duration-150"
-            onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-          >
-            {track.user.username}
-          </p>
-        </div>
+        <TrackTitleArtist track={track} highlight={isThis} size="sm" />
 
         <div className="hidden sm:flex items-center gap-3 shrink-0">
           {track.playback_count != null && (
@@ -476,6 +446,7 @@ export const PlaylistPage = React.memo(() => {
         !s.isPlaying && s.currentTrack != null && trackUrnSet.has(s.currentTrack.urn),
     })),
   );
+  const showPlayingOverlay = useAutoHide(isPlayingFromThis);
 
   const scrollRef = useInfiniteScroll(hasNextPage ?? false, isFetchingNextPage, fetchNextPage);
 
@@ -596,17 +567,13 @@ export const PlaylistPage = React.memo(() => {
 
             {/* Play overlay */}
             <div
-              className={`absolute inset-0 flex items-center justify-center transition-all duration-300 ${
-                isPlayingFromThis
-                  ? 'bg-black/30 opacity-100'
-                  : 'bg-black/0 opacity-0 group-hover/cover:bg-black/30 group-hover/cover:opacity-100'
+              className={`absolute inset-0 flex items-center justify-center transition-all duration-300 group-hover/cover:bg-black/30 group-hover/cover:opacity-100 ${
+                showPlayingOverlay ? 'bg-black/30 opacity-100' : 'bg-black/0 opacity-0'
               }`}
             >
               <div
-                className={`w-14 h-14 rounded-full flex items-center justify-center shadow-xl transition-all duration-300 ease-[var(--ease-apple)] ${
-                  isPlayingFromThis
-                    ? 'bg-white scale-100'
-                    : 'bg-white/90 scale-75 group-hover/cover:scale-100'
+                className={`w-14 h-14 rounded-full flex items-center justify-center shadow-xl transition-all duration-300 ease-[var(--ease-apple)] group-hover/cover:scale-100 ${
+                  showPlayingOverlay ? 'bg-white scale-100' : 'bg-white/90 scale-75'
                 }`}
               >
                 {isPlayingFromThis ? pauseBlack22 : playBlack22}

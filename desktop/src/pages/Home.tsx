@@ -5,6 +5,8 @@ import { useShallow } from 'zustand/shallow';
 import { LikeButton } from '../components/music/LikeButton';
 import { SoundWaveBlock, SoundWaveLockOverlay } from '../components/music/soundwave';
 import { TrackCard } from '../components/music/TrackCard';
+import { TrackTitleArtist } from '../components/music/TrackTitleArtist';
+import { UploadKindDot } from '../components/music/UploadKindDot';
 import { HorizontalScroll } from '../components/ui/HorizontalScroll';
 import { Skeleton } from '../components/ui/Skeleton';
 import { preloadTrack } from '../lib/audio';
@@ -43,6 +45,8 @@ import {
   Repeat2,
   Sparkles,
 } from '../lib/icons';
+import { getArtistTarget, useArtistDisplay, useDisplayTitle } from '../lib/track-display';
+import { useAutoHide } from '../lib/useAutoHide';
 import { useTrackPlay } from '../lib/useTrackPlay';
 import { useAuthStore } from '../stores/auth';
 import type { Track } from '../stores/player';
@@ -148,6 +152,7 @@ const FeaturedCard = React.memo(
     const { t } = useTranslation();
     const track = item.origin as Track;
     const { isThisPlaying, togglePlay } = useTrackPlay(track, queue);
+    const showPlayingOverlay = useAutoHide(isThisPlaying);
     const navigate = useNavigate();
     const isRepost = item.type.includes('repost');
     const cover = art(track.artwork_url);
@@ -194,17 +199,13 @@ const FeaturedCard = React.memo(
 
             {/* Hover play overlay on artwork */}
             <div
-              className={`absolute inset-0 flex items-center justify-center transition-all duration-300 ${
-                isThisPlaying
-                  ? 'bg-black/30 opacity-100'
-                  : 'bg-black/0 opacity-0 group-hover/cover:bg-black/30 group-hover/cover:opacity-100'
+              className={`absolute inset-0 flex items-center justify-center transition-all duration-300 group-hover/cover:bg-black/30 group-hover/cover:opacity-100 ${
+                showPlayingOverlay ? 'bg-black/30 opacity-100' : 'bg-black/0 opacity-0'
               }`}
             >
               <div
-                className={`w-12 h-12 rounded-full flex items-center justify-center shadow-xl transition-all duration-300 ease-[var(--ease-apple)] ${
-                  isThisPlaying
-                    ? 'bg-white scale-100'
-                    : 'bg-white/90 scale-75 group-hover/cover:scale-100'
+                className={`w-12 h-12 rounded-full flex items-center justify-center shadow-xl transition-all duration-300 ease-[var(--ease-apple)] group-hover/cover:scale-100 ${
+                  showPlayingOverlay ? 'bg-white scale-100' : 'bg-white/90 scale-75'
                 }`}
               >
                 {isThisPlaying ? pauseBlack18 : playBlack18}
@@ -223,29 +224,7 @@ const FeaturedCard = React.memo(
               </div>
             )}
 
-            <h2
-              className="text-xl font-bold text-white/95 truncate leading-tight cursor-pointer hover:text-white transition-colors duration-200"
-              onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
-            >
-              {track.title}
-            </h2>
-
-            <div
-              className="flex items-center gap-2 mt-2 cursor-pointer group/artist"
-              onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-            >
-              {avatar && (
-                <img
-                  src={avatar}
-                  alt=""
-                  className="w-5 h-5 rounded-full ring-1 ring-white/[0.08] group-hover/artist:ring-white/[0.15] transition-all duration-150"
-                  decoding="async"
-                />
-              )}
-              <p className="text-[13px] text-white/40 truncate group-hover/artist:text-white/60 transition-colors duration-150">
-                {track.user.username}
-              </p>
-            </div>
+            <FeaturedTitleArtist track={track} avatar={avatar} navigate={navigate} />
 
             <div className="flex items-center gap-3 mt-4 flex-wrap">
               {track.genre && (
@@ -287,14 +266,55 @@ const FeaturedCard = React.memo(
   (prev, next) => prev.item.origin.urn === next.item.origin.urn,
 );
 
+const FeaturedTitleArtist = React.memo(function FeaturedTitleArtist({
+  track,
+  avatar,
+  navigate,
+}: {
+  track: Track;
+  avatar: string | null;
+  navigate: ReturnType<typeof useNavigate>;
+}) {
+  const artistDisplay = useArtistDisplay(track);
+  const displayTitle = useDisplayTitle(track);
+  const artistTarget = getArtistTarget(track);
+  return (
+    <>
+      <h2
+        className="text-xl font-bold text-white/95 truncate leading-tight cursor-pointer hover:text-white transition-colors duration-200"
+        onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
+      >
+        {displayTitle}
+      </h2>
+      <div
+        className="flex items-center gap-2 mt-2 cursor-pointer group/artist"
+        onClick={artistTarget ? () => navigate(artistTarget) : undefined}
+      >
+        {avatar && (
+          <img
+            src={avatar}
+            alt=""
+            className="w-5 h-5 rounded-full ring-1 ring-white/[0.08] group-hover/artist:ring-white/[0.15] transition-all duration-150"
+            decoding="async"
+          />
+        )}
+        <UploadKindDot kind={artistDisplay.uploadKind} />
+        <p className="text-[13px] text-white/40 truncate group-hover/artist:text-white/60 transition-colors duration-150">
+          {artistDisplay.primary}
+        </p>
+      </div>
+    </>
+  );
+});
+
 /* ── Feed Track Card (compact horizontal) ─────────────────── */
 
 const FeedTrackCard = React.memo(
   function FeedTrackCard({ item, queue }: { item: FeedItem; queue: Track[] }) {
     const { t } = useTranslation();
-    const navigate = useNavigate();
     const track = item.origin as Track;
     const { isThis, isThisPlaying, togglePlay } = useTrackPlay(track, queue);
+    const showPlayingOverlay = useAutoHide(isThisPlaying);
     const isRepost = item.type.includes('repost');
     const cover = art(track.artwork_url, 't300x300');
 
@@ -326,15 +346,13 @@ const FeedTrackCard = React.memo(
 
           {/* Play overlay */}
           <div
-            className={`absolute inset-0 flex items-center justify-center transition-all duration-200 ${
-              isThisPlaying
-                ? 'bg-black/30 opacity-100'
-                : 'bg-black/0 opacity-0 group-hover:bg-black/30 group-hover:opacity-100'
+            className={`absolute inset-0 flex items-center justify-center transition-all duration-200 group-hover:bg-black/30 group-hover:opacity-100 ${
+              showPlayingOverlay ? 'bg-black/30 opacity-100' : 'bg-black/0 opacity-0'
             }`}
           >
             <div
-              className={`w-9 h-9 rounded-full flex items-center justify-center shadow-lg transition-all duration-200 ease-[var(--ease-apple)] ${
-                isThisPlaying ? 'bg-white scale-100' : 'bg-white/90 scale-75 group-hover:scale-100'
+              className={`w-9 h-9 rounded-full flex items-center justify-center shadow-lg transition-all duration-200 ease-[var(--ease-apple)] group-hover:scale-100 ${
+                showPlayingOverlay ? 'bg-white scale-100' : 'bg-white/90 scale-75'
               }`}
             >
               {isThisPlaying ? pauseBlack14 : playBlack14}
@@ -350,18 +368,7 @@ const FeedTrackCard = React.memo(
               <span>{t('home.reposted')}</span>
             </div>
           )}
-          <p
-            className="text-[13px] font-medium text-white/90 truncate leading-snug cursor-pointer hover:text-white transition-colors duration-150"
-            onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
-          >
-            {track.title}
-          </p>
-          <p
-            className="text-[11px] text-white/35 truncate mt-0.5 cursor-pointer hover:text-white/55 transition-colors duration-150"
-            onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-          >
-            {track.user.username}
-          </p>
+          <TrackTitleArtist track={track} highlight={isThis} size="sm" className="" />
           <div className="flex items-center gap-2 mt-1.5 text-[10px] text-white/20 tabular-nums">
             {track.genre && (
               <span className="px-1.5 py-px rounded-full bg-white/[0.04] text-white/30 border border-white/[0.04] text-[9px]">

@@ -1,10 +1,11 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import React, { useEffect, useMemo, useState } from 'react';
-import { useTranslation } from 'react-i18next';
+import { Trans, useTranslation } from 'react-i18next';
 import { useNavigate, useParams } from 'react-router-dom';
 import { toast } from 'sonner';
 import { AddToPlaylistDialog } from '../components/music/AddToPlaylistDialog';
 import { SoundWaveSimilarBlock } from '../components/music/soundwave';
+import { TrackTitleArtist } from '../components/music/TrackTitleArtist';
 import { api } from '../lib/api';
 import { getCurrentTime, preloadTrack } from '../lib/audio';
 import { downloadTrack } from '../lib/cache';
@@ -40,10 +41,10 @@ import {
   playBlack11,
   playBlack22,
   playCurrent16,
-  Repeat2,
   Send,
 } from '../lib/icons';
 import { optimisticToggleLike, setLikedUrn, useLiked } from '../lib/likes';
+import { getArtistDisplay, getDisplayTitle, getParticipants } from '../lib/track-display';
 import { useTrackPlay } from '../lib/useTrackPlay';
 import { useLyricsStore } from '../stores/lyrics';
 import { type Track, usePlayerStore } from '../stores/player';
@@ -58,6 +59,35 @@ function parseTags(tagList?: string): string[] {
   }
   return tags;
 }
+
+/* ── Inline list of clickable artist names ─────────────── */
+
+const ArtistLinks = React.memo(function ArtistLinks({
+  artists,
+}: {
+  artists: { id: string; name: string }[];
+}) {
+  const navigate = useNavigate();
+  return (
+    <>
+      {artists.map((a, i) => (
+        <React.Fragment key={a.id || a.name}>
+          {i > 0 && ', '}
+          <span
+            className={
+              a.id
+                ? 'text-white/55 hover:text-white/80 cursor-pointer transition-colors'
+                : undefined
+            }
+            onClick={a.id ? () => navigate(`/artist/${encodeURIComponent(a.id)}`) : undefined}
+          >
+            {a.name}
+          </span>
+        </React.Fragment>
+      ))}
+    </>
+  );
+});
 
 /* ── Engagement chip (Like / Repost) — compact icon+count ──── */
 
@@ -136,39 +166,6 @@ const LikeBtn = React.memo(({ trackUrn, count }: { trackUrn: string; count?: num
       icon={<Heart size={14} fill={liked ? 'currentColor' : 'none'} />}
       count={localCount}
       label={t('track.likes')}
-      onClick={toggle}
-    />
-  );
-});
-
-/* ── Repost Button ───────────────────────────────────────── */
-
-const RepostBtn = React.memo(({ trackUrn, count }: { trackUrn: string; count?: number }) => {
-  const { t } = useTranslation();
-  const [reposted, setReposted] = useState(false);
-  const [localCount, setLocalCount] = useState(count ?? 0);
-
-  const toggle = async () => {
-    const next = !reposted;
-    setReposted(next);
-    setLocalCount((c) => c + (next ? 1 : -1));
-    try {
-      await api(`/reposts/tracks/${encodeURIComponent(trackUrn)}`, {
-        method: next ? 'POST' : 'DELETE',
-      });
-    } catch {
-      setReposted(!next);
-      setLocalCount((c) => c + (next ? -1 : 1));
-    }
-  };
-
-  return (
-    <EngagementChip
-      active={reposted}
-      activeTone="emerald"
-      icon={<Repeat2 size={14} />}
-      count={localCount}
-      label={t('track.reposts')}
       onClick={toggle}
     />
   );
@@ -337,7 +334,6 @@ const CommentForm = React.memo(({ trackUrn }: { trackUrn: string }) => {
 
 const RelatedRow = React.memo(
   ({ track, queue }: { track: Track; queue: Track[] }) => {
-    const navigate = useNavigate();
     const { isThis, isThisPlaying, togglePlay } = useTrackPlay(track, queue);
     const cover = art(track.artwork_url, 't200x200');
 
@@ -372,20 +368,7 @@ const RelatedRow = React.memo(
           </div>
         </div>
 
-        <div className="flex-1 min-w-0">
-          <p
-            className="text-[12px] font-medium text-white/85 truncate cursor-pointer hover:text-white transition-colors duration-150"
-            onClick={() => navigate(`/track/${encodeURIComponent(track.urn)}`)}
-          >
-            {track.title}
-          </p>
-          <p
-            className="text-[11px] text-white/30 truncate mt-0.5 cursor-pointer hover:text-white/50 transition-colors duration-150"
-            onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-          >
-            {track.user.username}
-          </p>
-        </div>
+        <TrackTitleArtist track={track} size="sm" />
 
         <div className="text-right shrink-0">
           <p className="text-[10px] text-white/25 tabular-nums">{dur(track.duration)}</p>
@@ -565,25 +548,113 @@ export const TrackPage = React.memo(() => {
               </span>
             )}
             <h1 className="text-2xl font-bold text-white/95 leading-tight mb-2 line-clamp-2">
-              {track.title}
+              {getDisplayTitle(track)}
             </h1>
 
             {/* Artist */}
-            <div
-              className="flex items-center gap-2.5 mb-5 cursor-pointer group/artist"
-              onClick={() => navigate(`/user/${encodeURIComponent(track.user.urn)}`)}
-            >
-              {track.user.avatar_url && (
-                <img
-                  src={art(track.user.avatar_url, 'small') ?? ''}
-                  alt=""
-                  className="w-6 h-6 rounded-full ring-1 ring-white/[0.08] group-hover/artist:ring-white/[0.15] transition-all duration-150"
-                />
-              )}
-              <span className="text-[14px] text-white/50 group-hover/artist:text-white/70 transition-colors">
-                {track.user.username}
-              </span>
-            </div>
+            {(() => {
+              const artistDisplay = getArtistDisplay(track);
+              const participants = getParticipants(track);
+              const realArtistId = track.enrichment?.primary_artist?.id;
+              const artistTarget =
+                realArtistId && artistDisplay.verified
+                  ? `/artist/${encodeURIComponent(realArtistId)}`
+                  : `/user/${encodeURIComponent(track.user.urn)}`;
+              return (
+                <div className="mb-5">
+                  <div
+                    className="flex items-center gap-2.5 cursor-pointer group/artist"
+                    onClick={() => navigate(artistTarget)}
+                  >
+                    {track.user.avatar_url && (
+                      <img
+                        src={art(track.user.avatar_url, 'small') ?? ''}
+                        alt=""
+                        className="w-6 h-6 rounded-full ring-1 ring-white/[0.08] group-hover/artist:ring-white/[0.15] transition-all duration-150"
+                      />
+                    )}
+                    <span className="text-[14px] text-white/60 group-hover/artist:text-white/80 transition-colors">
+                      {artistDisplay.primary}
+                    </span>
+                    {artistDisplay.isEnriched && artistDisplay.verified && (
+                      <span
+                        className="text-[10px] uppercase tracking-wider text-emerald-400/70"
+                        title={t('track.verifiedArtist', {
+                          confidence: (artistDisplay.confidence ?? 0).toFixed(2),
+                        })}
+                      >
+                        ✓
+                      </span>
+                    )}
+                    {artistDisplay.isEnriched && !artistDisplay.verified && (
+                      <span
+                        className="text-[10px] uppercase tracking-wider text-amber-400/60"
+                        title={t('track.unverifiedArtist', {
+                          confidence: (artistDisplay.confidence ?? 0).toFixed(2),
+                        })}
+                      >
+                        ?
+                      </span>
+                    )}
+                    {artistDisplay.uploadKind && (
+                      <span
+                        className={`px-1.5 py-0.5 rounded-md text-[9px] uppercase tracking-wider font-semibold ${
+                          artistDisplay.uploadKind === 'original'
+                            ? 'bg-emerald-500/15 text-emerald-400/80'
+                            : artistDisplay.uploadKind === 'demo'
+                              ? 'bg-sky-500/15 text-sky-400/80'
+                              : artistDisplay.uploadKind === 'alt'
+                                ? 'bg-violet-500/15 text-violet-400/80'
+                                : 'bg-amber-500/12 text-amber-400/70'
+                        }`}
+                        title={t(`track.uploadKind.${artistDisplay.uploadKind}`)}
+                      >
+                        {t(`track.uploadKind.${artistDisplay.uploadKind}`)}
+                      </span>
+                    )}
+                  </div>
+                  {(artistDisplay.uploader || participants) && (
+                    <div className="ml-8 mt-1 text-[12px] text-white/35">
+                      {participants && (
+                        <span>
+                          {participants.featured.length > 0 && (
+                            <>
+                              feat. <ArtistLinks artists={participants.featured} />
+                            </>
+                          )}
+                          {participants.featured.length > 0 &&
+                            participants.remixers.length > 0 &&
+                            ' · '}
+                          {participants.remixers.length > 0 && (
+                            <>
+                              <ArtistLinks artists={participants.remixers} /> Remix
+                            </>
+                          )}
+                        </span>
+                      )}
+                      {participants && artistDisplay.uploader && <span> · </span>}
+                      {artistDisplay.uploader && (
+                        <span>
+                          <Trans
+                            i18nKey="track.uploadedBy"
+                            values={{ name: artistDisplay.uploader }}
+                            components={[
+                              <span
+                                key="uploader-link"
+                                className="text-white/55 hover:text-white/80 cursor-pointer transition-colors"
+                                onClick={() =>
+                                  navigate(`/user/${encodeURIComponent(track.user.urn)}`)
+                                }
+                              />,
+                            ]}
+                          />
+                        </span>
+                      )}
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {/* ── Action bar: primary + engagement chips + icon rail ── */}
             <div className="flex items-center gap-3 flex-wrap">
@@ -611,7 +682,6 @@ export const TrackPage = React.memo(() => {
                   trackUrn={track.urn}
                   count={track.favoritings_count ?? track.likes_count}
                 />
-                <RepostBtn trackUrn={track.urn} count={track.reposts_count} />
               </div>
 
               {/* Utility rail: glass container with icon-only actions */}
@@ -659,11 +729,6 @@ export const TrackPage = React.memo(() => {
             {fc(track.favoritings_count ?? track.likes_count)}
           </span>
           <span className="text-white/15">{t('track.likes')}</span>
-        </div>
-        <div className="flex items-center gap-1.5 text-[12px] text-white/30">
-          <Repeat2 size={13} className="text-white/20" />
-          <span className="tabular-nums font-medium">{fc(track.reposts_count)}</span>
-          <span className="text-white/15">{t('track.reposts')}</span>
         </div>
         <div className="flex items-center gap-1.5 text-[12px] text-white/30">
           <MessageCircle size={13} className="text-white/20" />

@@ -43,7 +43,7 @@ export async function ensureTrackCached(
   const { buildStorageUrls, streamFallbackUrls, getSessionId } = await import('./api');
   const sessionId = getSessionId();
   const urls = streamFallbackUrls(urn, highQualityStreaming);
-  const storageUrls = buildStorageUrls(urn, highQualityStreaming);
+  const storageUrls = buildStorageUrls(urn);
 
   return invoke<TrackCacheInfo>('track_ensure_cached', {
     urn,
@@ -67,6 +67,10 @@ export function clearCache(): Promise<void> {
 
 export function clearLikedCache(): Promise<void> {
   return invoke('track_clear_liked_cache');
+}
+
+export function removeCachedTrack(urn: string): Promise<boolean> {
+  return invoke<boolean>('track_remove_cached', { urn });
 }
 
 export function listCachedUrns(): Promise<string[]> {
