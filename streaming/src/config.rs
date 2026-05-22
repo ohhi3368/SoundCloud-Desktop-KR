@@ -11,8 +11,10 @@ pub struct Config {
     pub sc_proxy_url: String,
     pub sc_proxy_fallback: bool,
     pub sc_oauth_fallback_sessions: usize,
-    pub sc_cookies: String,
-    pub sc_oauth_token: Option<String>,
+    /// SC_COOKIES может содержать одну или несколько cookies-строк,
+    /// разделённых переводом строки. Каждая обрабатывается как отдельная
+    /// сессия в пуле — ротация на 429.
+    pub sc_cookies: Vec<String>,
     pub premium_only: bool,
     pub storage_url: String,
     pub storage_public_url: String,
@@ -22,12 +24,12 @@ pub struct Config {
     pub storage_max_size_bytes: u64,
     pub storage_cleanup_interval_secs: u64,
     pub internal_token: String,
+    pub decrypt_device: Option<String>,
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        let cookies = env::var("SC_COOKIES").unwrap_or_default();
-        let oauth_token = parse_cookie_value(&cookies, "oauth_token");
+        let cookies = parse_cookie_list(&env::var("SC_COOKIES").unwrap_or_default());
 
         let storage_url = env::var("STORAGE_URL").unwrap_or_default();
         let storage_public_url = env::var("STORAGE_PUBLIC_URL")
@@ -64,7 +66,6 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(10),
             sc_cookies: cookies,
-            sc_oauth_token: oauth_token,
             premium_only: env::var("PREMIUM_ONLY")
                 .map(|v| v == "true")
                 .unwrap_or(false),
@@ -85,6 +86,7 @@ impl Config {
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
             internal_token: env::var("INTERNAL_TOKEN").unwrap_or_default(),
+            decrypt_device: env::var("SC_DECRYPT_DEVICE").ok().filter(|s| !s.is_empty()),
         }
     }
 
@@ -93,11 +95,21 @@ impl Config {
     }
 
     pub fn cookies_enabled(&self) -> bool {
-        !self.sc_cookies.is_empty() && self.sc_oauth_token.is_some()
+        self.sc_cookies
+            .iter()
+            .any(|c| parse_cookie_value(c, "oauth_token").is_some())
     }
 }
 
-fn parse_cookie_value(cookies: &str, name: &str) -> Option<String> {
+fn parse_cookie_list(raw: &str) -> Vec<String> {
+    raw.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+pub fn parse_cookie_value(cookies: &str, name: &str) -> Option<String> {
     for part in cookies.split(';') {
         let part = part.trim();
         if let Some(idx) = part.find('=') {

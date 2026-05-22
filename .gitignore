@@ -11,12 +11,8 @@ Thumbs.db
 .claude
 .pnpm-store/
 
-# Tauri build output
-src-tauri/target/
-streaming/target
-storage/target
-tls-common/target
-backend/target
+# Rust build output
+target
 
 storage/data
 streaming/data

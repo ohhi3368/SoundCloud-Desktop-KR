@@ -3,11 +3,12 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
-# Shared tls-common crate is provided as a named build context.
-# `additional_contexts: tls-common: ../tls-common` in compose,
-# or `docker build --build-context tls-common=../tls-common ./streaming`.
-COPY --from=tls-common . /app/tls-common
-COPY --from=call . /app/call
+# Shared utils-крейты приходят отдельными named build context'ами.
+# `additional_contexts:` в compose или `--build-context name=../utils/<name>` в docker build.
+COPY --from=tls-common . /app/utils/tls-common
+COPY --from=call . /app/utils/call
+COPY --from=decrypt . /app/utils/decrypt
+COPY --from=decrypt-client . /app/utils/decrypt-client
 
 WORKDIR /app/streaming
 
@@ -22,7 +23,7 @@ RUN touch src/main.rs && cargo build --release
 # Runtime
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /app/streaming/target/release/streaming /usr/local/bin/streaming
 
