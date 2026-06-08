@@ -1,13 +1,17 @@
 use qdrant_client::qdrant::{Condition, Filter};
-use serde_json::{json, Value};
+use serde_json::json;
 use std::collections::{HashMap, HashSet};
 
 use crate::error::AppResult;
-use crate::modules::ltr::LTR_FEATURE_COUNT;
 
 use super::types::{RecommendResult, ScoredCandidate};
 use super::util::value_id_to_string;
 use super::RecommendationsService;
+
+/// Длина вектора фичей в impressions. Совпадает с тем, что писали при живом
+/// LTR-пайплайне; держим стабильным, чтобы аналитика по rec_impressions не
+/// сломалась. См. docs/ltr-future-graph-features.md перед изменением.
+const IMPRESSION_FEATURE_LEN: usize = 8;
 
 impl RecommendationsService {
     pub(crate) async fn enrich_and_boost(
@@ -19,16 +23,28 @@ impl RecommendationsService {
             return Ok(Vec::new());
         }
         let ids: Vec<String> = items.iter().map(|it| it.id.to_string()).collect();
-        let tracks: Vec<(String, Option<Value>, Option<String>)> = sqlx::query_as(
-            "SELECT sc_track_id, raw_sc_data, language FROM indexed_tracks \
-             WHERE sc_track_id = ANY($1)",
+        // Берём normalised поля из `tracks` (artist берём из uploader_username,
+        // т.к. publisher_metadata/artist у нас уже нет: эту инфу теперь
+        // выводит enrich-pipeline через track_artists; для denorm-минимума
+        // достаточно uploader_username).
+        type TrackMetaRow = (
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            Option<i64>,
+        );
+        type TrackMeta = (Option<String>, Option<String>, Option<String>, Option<i64>);
+        let tracks: Vec<TrackMetaRow> = sqlx::query_as(
+            "SELECT sc_track_id, uploader_username, genre, language, play_count_sc \
+                 FROM tracks WHERE sc_track_id = ANY($1)",
         )
         .bind(&ids)
         .fetch_all(&self.pg)
         .await?;
-        let by_id: HashMap<String, (Option<Value>, Option<String>)> = tracks
+        let by_id: HashMap<String, TrackMeta> = tracks
             .into_iter()
-            .map(|(id, raw, lang)| (id, (raw, lang)))
+            .map(|(id, uploader, genre, lang, plays)| (id, (uploader, genre, lang, plays)))
             .collect();
         let boost = self.cfg.popularity_boost as f32;
         let user_lang_set: HashSet<String> = user_languages
@@ -40,30 +56,13 @@ impl RecommendationsService {
             .map(|it| {
                 let key = it.id.to_string();
                 let entry = by_id.get(&key);
-                let raw = entry
-                    .and_then(|(r, _)| r.as_ref())
-                    .cloned()
-                    .unwrap_or(Value::Null);
-                let language = entry.and_then(|(_, l)| l.clone());
-                let artist_pub = raw
-                    .get("publisher_metadata")
-                    .and_then(|v| v.get("artist"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let artist_user = raw
-                    .get("user")
-                    .and_then(|v| v.get("username"))
-                    .and_then(|v| v.as_str())
-                    .map(String::from);
-                let artist = artist_pub.or(artist_user);
-                let genre = raw.get("genre").and_then(|v| v.as_str()).map(String::from);
-                let playback_count = raw
-                    .get("playback_count")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0);
+                let artist = entry.and_then(|(u, _, _, _)| u.clone());
+                let genre = entry.and_then(|(_, g, _, _)| g.clone());
+                let language = entry.and_then(|(_, _, l, _)| l.clone());
+                let playback_count = entry.and_then(|(_, _, _, p)| *p).unwrap_or(0);
                 let bonus = ((playback_count.max(0) as f64).ln_1p() as f32) * boost;
                 let mut features = it.features.clone();
-                if features.len() >= LTR_FEATURE_COUNT {
+                if features.len() >= IMPRESSION_FEATURE_LEN {
                     features[4] = (playback_count.max(0) as f64).ln_1p() as f32;
                     features[5] = match language.as_deref() {
                         Some(l) if user_lang_set.contains(l) => 1.0,
@@ -119,30 +118,49 @@ impl RecommendationsService {
     pub(crate) fn build_filter(
         &self,
         exclude: &[String],
-        languages: Option<&[String]>,
+        _languages: Option<&[String]>,
     ) -> Option<Filter> {
-        let mut filter = Filter::default();
-        let mut populated = false;
-
-        if !exclude.is_empty() {
-            let must_not: Vec<Condition> = exclude
+        // language пока живёт только в pg.tracks — qdrant payload его не
+        // несёт, фильтрация по языку идёт после возврата кандидатов через
+        // filter_tracks_by_language. Трек без выставленного language не
+        // режется, шанс на показ остаётся.
+        if exclude.is_empty() {
+            return None;
+        }
+        Some(Filter {
+            must_not: exclude
                 .iter()
                 .map(|id| Condition::matches("sc_track_id", id.clone()))
-                .collect();
-            filter.must_not = must_not;
-            populated = true;
+                .collect(),
+            ..Default::default()
+        })
+    }
+
+    /// Если выбраны языки, оставляем только треки с `language IN (langs)` или
+    /// `language IS NULL` (трек ещё не классифицирован — даём шанс на показ).
+    /// Принимает sc_track_id'ы, возвращает множество разрешённых.
+    pub(crate) async fn filter_tracks_by_language(
+        &self,
+        sc_track_ids: &[String],
+        languages: Option<&[String]>,
+    ) -> std::collections::HashSet<String> {
+        let langs = match languages {
+            Some(l) if !l.is_empty() => l,
+            _ => return sc_track_ids.iter().cloned().collect(),
+        };
+        if sc_track_ids.is_empty() {
+            return std::collections::HashSet::new();
         }
-        if let Some(langs) = languages {
-            if !langs.is_empty() {
-                let must = vec![Condition::matches("language", langs.to_vec())];
-                filter.must = must;
-                populated = true;
-            }
-        }
-        if populated {
-            Some(filter)
-        } else {
-            None
-        }
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT sc_track_id FROM tracks \
+             WHERE sc_track_id = ANY($1) \
+               AND (language IS NULL OR language = ANY($2))",
+        )
+        .bind(sc_track_ids)
+        .bind(langs)
+        .fetch_all(&self.pg)
+        .await
+        .unwrap_or_default();
+        rows.into_iter().map(|(id,)| id).collect()
     }
 }

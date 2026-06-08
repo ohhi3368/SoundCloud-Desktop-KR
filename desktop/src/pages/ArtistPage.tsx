@@ -3,20 +3,27 @@ import { useTranslation } from 'react-i18next';
 import { useParams } from 'react-router-dom';
 import { ArtistAboutTab } from '../components/artist/ArtistAboutTab';
 import { ArtistAlbumsTab } from '../components/artist/ArtistAlbumsTab';
+import { ArtistCoversTab } from '../components/artist/ArtistCoversTab';
 import { ArtistHero } from '../components/artist/ArtistHero';
 import { ArtistRelatedTab } from '../components/artist/ArtistRelatedTab';
 import { ArtistTracksTab, type TracksView } from '../components/artist/ArtistTracksTab';
 import type { ArtistTabId, TracksSort } from '../components/artist/types';
-import { useArtistDetail, useArtistStar } from '../components/artist/useArtistData';
+import {
+  useArtistCovers,
+  useArtistDetail,
+  useArtistStar,
+} from '../components/artist/useArtistData';
 import { ArtistSoundWave } from '../components/artist/wave';
 import { AuraField } from '../components/user/AuraField';
 import { USER_PAGE_KEYFRAMES } from '../components/user/keyframes';
 import { type TabDescriptor, TabDock } from '../components/user/TabDock';
 import { Loader2 } from '../lib/icons';
+import {usePerfMode} from '../lib/perf';
 
 export function ArtistPage() {
   const { id } = useParams<{ id: string }>();
   const { t } = useTranslation();
+    const perf = usePerfMode();
 
   const detail = useArtistDetail(id);
   const artist = detail.data;
@@ -28,6 +35,9 @@ export function ArtistPage() {
   const [featuredSort, setFeaturedSort] = useState<TracksSort>('popular');
   const [primaryView, setPrimaryView] = useState<TracksView>('list');
   const [featuredView, setFeaturedView] = useState<TracksView>('list');
+
+  const coversQuery = useArtistCovers(id);
+  const coversCount = coversQuery.data?.length ?? 0;
 
   const tabs = useMemo<ReadonlyArray<TabDescriptor<ArtistTabId>>>(() => {
     if (!artist) return [];
@@ -41,6 +51,9 @@ export function ArtistPage() {
         count: artist.track_count_featured,
       });
     }
+    if (coversCount > 0) {
+      out.push({ id: 'covers', label: t('artist.covers', 'Covers'), count: coversCount });
+    }
     out.push({ id: 'albums', label: t('artist.albums'), count: artist.album_count });
     out.push({
       id: 'related',
@@ -49,7 +62,7 @@ export function ArtistPage() {
     });
     out.push({ id: 'about', label: t('artist.about'), count: undefined });
     return out;
-  }, [artist, t]);
+  }, [artist, t, coversCount]);
 
   if (detail.isLoading || (!artist && !detail.error)) {
     return (
@@ -91,9 +104,13 @@ export function ArtistPage() {
             className="rounded-[2rem] p-3 md:p-5"
             style={{
               background:
-                'linear-gradient(180deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.015) 100%)',
-              backdropFilter: 'blur(28px) saturate(160%)',
-              WebkitBackdropFilter: 'blur(28px) saturate(160%)',
+                  perf.blur(28) > 0
+                      ? 'linear-gradient(180deg, rgba(255,255,255,0.035) 0%, rgba(255,255,255,0.015) 100%)'
+                      : 'rgba(18,18,22,0.85)',
+                backdropFilter:
+                    perf.blur(28) > 0 ? `blur(${perf.blur(28)}px) saturate(160%)` : undefined,
+                WebkitBackdropFilter:
+                    perf.blur(28) > 0 ? `blur(${perf.blur(28)}px) saturate(160%)` : undefined,
               boxShadow:
                 '0 30px 80px rgba(0,0,0,0.30), inset 0 0 0 1px rgba(255,255,255,0.06), inset 0 1px 0 rgba(255,255,255,0.05)',
             }}
@@ -120,6 +137,7 @@ export function ArtistPage() {
                 onViewChange={setFeaturedView}
               />
             )}
+            {tab === 'covers' && <ArtistCoversTab artistId={artist.id} aura={aura} />}
             {tab === 'albums' && <ArtistAlbumsTab artistId={artist.id} aura={aura} />}
             {tab === 'related' && <ArtistRelatedTab related={artist.related_artists} aura={aura} />}
             {tab === 'about' && <ArtistAboutTab artist={artist} aura={aura} />}

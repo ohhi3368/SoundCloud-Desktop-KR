@@ -26,36 +26,32 @@ use crate::bus::nats::NatsService;
 use crate::cache::{CacheService, ListCacheService};
 use crate::config::AppConfig;
 use crate::modules::auras::AurasService;
-use crate::modules::auth::{AuthService, LinkService};
-use crate::modules::centroids::CentroidService;
+use crate::modules::auth::{AuthService, LinkService, TokenProvider};
 use crate::modules::cold_refresh::ColdRefreshService;
 use crate::modules::collab::{CollabTrainerService, CollabVectorService};
 use crate::modules::discover::DiscoverService;
 use crate::modules::dislikes::DislikesService;
-use crate::modules::enrich::{
-    AiResolverClient, ArtistCrawlService, EnrichService, MbClient, TokenPool,
-};
+use crate::modules::enrich::{AiResolverClient, ArtistCrawlService, EnrichService, MbClient};
 use crate::modules::events::EventsService;
 use crate::modules::featured::FeaturedService;
 use crate::modules::history::HistoryService;
 use crate::modules::indexing::IndexingService;
 use crate::modules::likes::LikesService;
-use crate::modules::ltr::{LtrService, LtrTrainerService};
 use crate::modules::lyrics::genius::GeniusService;
 use crate::modules::lyrics::lrclib::LrclibService;
 use crate::modules::lyrics::musixmatch::MusixmatchService;
 use crate::modules::lyrics::netease::NeteaseService;
 use crate::modules::lyrics::{LyricsService, WorkerClient};
 use crate::modules::me::MeService;
-use crate::modules::oauth_apps::OAuthAppsService;
+use crate::modules::oauth_apps::{OAuthAppTokenService, OAuthAppsService};
 use crate::modules::playlists::PlaylistsService;
 use crate::modules::recommendations::{RecommendationsService, S3VerifierService};
 use crate::modules::resolve::ResolveService;
+use crate::modules::search::SearchService;
 use crate::modules::subscriptions::SubscriptionsService;
 use crate::modules::sync_queue::SyncQueueService;
 use crate::modules::tracks::TracksService;
 use crate::modules::transcode::TranscodeTriggerService;
-use crate::modules::user_taste::UserTasteService;
 use crate::modules::users::UsersService;
 use crate::qdrant::QdrantService;
 use crate::sc::ScClient;
@@ -70,6 +66,10 @@ async fn main() {
 
     let config = Arc::new(AppConfig::from_env());
     info!(port = config.port, "backend starting");
+    let reserve = config.premium_reserve;
+    if reserve {
+        info!("premium_reserve mode ON: background pipelines disabled");
+    }
 
     let pg = db::connect(&config)
         .await
@@ -119,8 +119,10 @@ async fn main() {
     );
 
     let oauth_apps = OAuthAppsService::new(pg.clone(), config.clone());
-    if let Err(e) = oauth_apps.migrate_env_app().await {
-        warn!(error = %e, "OAuthApps env migration failed");
+    if !reserve {
+        if let Err(e) = oauth_apps.migrate_env_app().await {
+            warn!(error = %e, "OAuthApps env migration failed");
+        }
     }
     match oauth_apps.count_active().await {
         Ok(n) => info!(active = n, "Active OAuth apps"),
@@ -137,6 +139,14 @@ async fn main() {
     );
     let link = LinkService::new(pg.clone(), auth.clone());
 
+    let oauth_app_tokens = OAuthAppTokenService::new(pg.clone(), sc.clone(), oauth_apps.clone());
+    if !reserve {
+        oauth_app_tokens
+            .clone()
+            .spawn_refresh_loop(shutdown.clone());
+    }
+    let tokens = TokenProvider::new(auth.clone(), oauth_app_tokens.clone());
+
     let cache = CacheService::new(redis_pool.clone());
     let list_cache = ListCacheService::new(redis_pool.clone());
     let events = EventsService::new(pg.clone());
@@ -148,20 +158,19 @@ async fn main() {
     if let Err(e) = subscriptions.restore_from_snapshot().await {
         warn!(error = %e, "subscriptions restore failed");
     }
-    subscriptions.spawn_snapshot_loop(shutdown.clone());
+    if !reserve {
+        subscriptions.spawn_snapshot_loop(shutdown.clone());
+    }
     let auras = AurasService::new(pg.clone(), subscriptions.clone());
     let sync_queue =
         SyncQueueService::new(pg.clone(), sc.clone(), auth.clone(), redis_pool.clone());
     let cold_refresh =
         ColdRefreshService::new(sc.clone(), pg.clone(), cache.clone(), config.cold.clone());
-    cold_refresh.clone().spawn_evict_loop(shutdown.clone());
     let me = MeService::new(
         sc.clone(),
         pg.clone(),
         list_cache.clone(),
         sync_queue.clone(),
-        cold_refresh.clone(),
-        events.clone(),
     );
     let tracks = TracksService::new(
         sc.clone(),
@@ -169,6 +178,7 @@ async fn main() {
         list_cache.clone(),
         sync_queue.clone(),
         cold_refresh.clone(),
+        tokens.clone(),
     );
     let playlists = PlaylistsService::new(
         sc.clone(),
@@ -176,22 +186,32 @@ async fn main() {
         list_cache.clone(),
         sync_queue.clone(),
         cold_refresh.clone(),
+        tokens.clone(),
     );
     let users = UsersService::new(
         sc.clone(),
         pg.clone(),
         list_cache.clone(),
         cold_refresh.clone(),
+        tokens.clone(),
     );
     let dislikes = DislikesService::new(pg.clone(), events.clone());
-    let likes = LikesService::new(pg.clone(), sync_queue.clone());
-    let resolve = ResolveService::new(sc.clone(), pg.clone());
+    let resolve = ResolveService::new(sc.clone(), tokens.clone());
+    let search = SearchService::new(pg.clone(), cache.clone());
     let history = HistoryService::new(pg.clone());
     let featured = FeaturedService::new(pg.clone(), sc.clone(), auth.clone());
-    let centroids = CentroidService::new(qdrant.clone());
-    let user_taste = UserTasteService::new(qdrant.clone());
-    let transcode = TranscodeTriggerService::new(http_client.clone(), config.clone(), nats.clone());
-    let worker = WorkerClient::new(nats.clone());
+    let s3_verifier =
+        S3VerifierService::new(http_client.clone(), config.storage.url.clone(), pg.clone());
+    let transcode = TranscodeTriggerService::new(
+        http_client.clone(),
+        config.clone(),
+        nats.clone(),
+        s3_verifier.clone(),
+    );
+    let worker = WorkerClient::new(nats.clone(), cache.clone(), qdrant.clone(), reserve);
+    if !reserve {
+        worker.spawn_done_consumer();
+    }
     let lrclib = LrclibService::new(external_fetcher.clone());
     let mxm = MusixmatchService::new(external_fetcher.clone(), config.mxm.api_base.clone());
     let genius = GeniusService::new(external_fetcher.clone(), config.genius.clone());
@@ -199,42 +219,69 @@ async fn main() {
     let lyrics = LyricsService::new(
         pg.clone(),
         nats.clone(),
+        qdrant.clone(),
         lrclib,
         mxm,
         genius.clone(),
         netease,
         worker.clone(),
         transcode.clone(),
+        s3_verifier.clone(),
         config.lyrics.indexing_concurrency,
+        reserve,
     );
-    lyrics.spawn_consumers();
-    lyrics.spawn_reap_loops(shutdown.clone());
+    if !reserve {
+        lyrics.spawn_consumers();
+        lyrics.spawn_reap_loops(shutdown.clone());
+    }
 
-    centroids.spawn_refresh_loop(shutdown.clone());
-
-    let collab_vector = CollabVectorService::new(qdrant.clone(), pg.clone());
+    let collab_vector = CollabVectorService::new(qdrant.clone());
     let collab_trainer = CollabTrainerService::new(
         pg.clone(),
         nats.clone(),
+        qdrant.clone(),
         collab_vector.clone(),
         config.collab.clone(),
     );
-    collab_trainer.spawn_bootstrap_and_cron(shutdown.clone());
+    if !reserve {
+        collab_trainer.spawn_bootstrap_and_cron(shutdown.clone());
+    }
 
-    let ltr = LtrService::new(nats.clone(), config.ltr.clone());
-    let ltr_trainer = LtrTrainerService::new(
+    let indexing = IndexingService::new(
         pg.clone(),
+        nats.clone(),
         qdrant.clone(),
-        collab_vector.clone(),
-        centroids.clone(),
-        ltr.clone(),
-        config.ltr.clone(),
+        lyrics.clone(),
+        transcode.clone(),
+        config.max_track_duration_ms,
     );
-    ltr_trainer.spawn_bootstrap_and_cron(shutdown.clone());
+    if !reserve {
+        indexing.spawn(shutdown.clone());
+    }
+    cold_refresh.install_indexing(indexing.clone());
 
-    let indexing =
-        IndexingService::new(pg.clone(), nats.clone(), lyrics.clone(), transcode.clone());
-    indexing.spawn(shutdown.clone());
+    let duration_resolver = crate::modules::indexing::DurationResolver::new(
+        pg.clone(),
+        resolve.clone(),
+        config.max_track_duration_ms,
+    );
+    if !reserve {
+        duration_resolver.spawn(shutdown.clone());
+    }
+
+    let artist_account_walker = crate::modules::enrich::ArtistAccountWalker::new(
+        pg.clone(),
+        sc.clone(),
+        tokens.clone(),
+        indexing.clone(),
+    );
+
+    let likes = LikesService::new(
+        pg.clone(),
+        sync_queue.clone(),
+        indexing.clone(),
+        events.clone(),
+    );
 
     let mb = MbClient::new(
         external_fetcher.clone(),
@@ -253,25 +300,25 @@ async fn main() {
     };
     let enrich = EnrichService::new(
         pg.clone(),
-        nats.clone(),
         mb.clone(),
         genius.clone(),
         ai_resolver,
         config.enrich.clone(),
     );
-    enrich.spawn(shutdown.clone());
+    if !reserve {
+        if let Some(kicker) = enrich.spawn(shutdown.clone()) {
+            indexing.install_enrich_kicker(kicker);
+        }
+    }
 
-    let token_pool = Arc::new(TokenPool::new(pg.clone()));
     let artist_crawl = ArtistCrawlService::new(
         pg.clone(),
         mb,
         genius.clone(),
         sc.clone(),
-        token_pool.clone(),
+        tokens.clone(),
         resolve.clone(),
-        config.enrich_crawl.clone(),
     );
-    artist_crawl.spawn(shutdown.clone());
 
     let ai_matcher = if config.enrich.ai_enabled {
         Some(crate::modules::enrich::ai_matcher::AiMatcherClient::new(
@@ -287,7 +334,7 @@ async fn main() {
     let sc_account_scanner = crate::modules::enrich::sc_account_scan::ScAccountScanner::new(
         pg.clone(),
         sc.clone(),
-        token_pool.clone(),
+        tokens.clone(),
         indexing.clone(),
         ai_matcher.clone(),
     );
@@ -295,56 +342,71 @@ async fn main() {
     let wanted_resolver = crate::modules::enrich::WantedResolverService::new(
         pg.clone(),
         sc.clone(),
-        token_pool.clone(),
+        tokens.clone(),
         indexing.clone(),
         sc_account_scanner.clone(),
         ai_matcher.clone(),
         &config.enrich_crawl,
     );
-    wanted_resolver.spawn(shutdown.clone());
+    if !reserve {
+        wanted_resolver.spawn(shutdown.clone());
+    }
     let wanted_resolver_state = wanted_resolver.clone();
 
     let discover = DiscoverService::new(pg.clone(), cache.clone(), subscriptions.clone());
-    discover.clone().spawn_refresh_loop(shutdown.clone());
-    enrich.install_followup(artist_crawl.clone(), wanted_resolver.clone());
+    if !reserve {
+        discover.clone().spawn_refresh_loop(shutdown.clone());
 
-    let track_discovery =
-        crate::modules::indexing::TrackDiscoveryService::new(sc.clone(), indexing.clone());
-    sc.install_track_observer(track_discovery.clone());
+        // Catalog discovery (crawl every artist on Genius/MB) on the work pool.
+        crate::modules::discovery::spawn(
+            pg.clone(),
+            artist_crawl.clone(),
+            artist_account_walker.clone(),
+            wanted_resolver.clone(),
+            &config.discovery,
+            shutdown.clone(),
+        );
 
-    let s3_verifier =
-        S3VerifierService::new(http_client.clone(), config.storage.url.clone(), pg.clone());
+        let track_discovery =
+            crate::modules::indexing::TrackDiscoveryService::new(sc.clone(), indexing.clone());
+        sc.install_track_observer(track_discovery.clone());
+    }
+
     let recommendations = RecommendationsService::new(
         qdrant.clone(),
         pg.clone(),
+        redis_pool.clone(),
         worker.clone(),
         s3_verifier.clone(),
-        centroids.clone(),
         collab_vector.clone(),
-        ltr.clone(),
         config.soundwave.clone(),
     );
 
+    let vibe = crate::modules::search::VibeSearchService::new(
+        pg.clone(),
+        cache.clone(),
+        recommendations.clone(),
+        worker.clone(),
+        qdrant.clone(),
+    );
+
     events.install_deps(
-        user_taste.clone(),
         indexing.clone(),
         dislikes.clone(),
-        collab_vector.clone(),
         collab_trainer.clone(),
     );
-    events.spawn_indexing_queue_consumer(nats.clone());
 
-    crate::modules::recommendations::cron::spawn_cron_loops(
-        recommendations.clone(),
-        nats.clone(),
-        qdrant.clone(),
-        pg.clone(),
-        shutdown.clone(),
-    );
+    if !reserve {
+        crate::modules::recommendations::cron::spawn_cron_loops(
+            recommendations.clone(),
+            nats.clone(),
+            shutdown.clone(),
+        );
+    }
 
     let mut tasks = JoinSet::new();
 
-    {
+    if !reserve {
         let token = shutdown.clone();
         let sq = sync_queue.clone();
         tasks.spawn(async move {
@@ -362,7 +424,7 @@ async fn main() {
         });
     }
 
-    {
+    if !reserve {
         let token = shutdown.clone();
         let auth = auth.clone();
         tasks.spawn(async move {
@@ -380,7 +442,7 @@ async fn main() {
         });
     }
 
-    {
+    if !reserve {
         let token = shutdown.clone();
         let auth = auth.clone();
         tasks.spawn(async move {
@@ -402,6 +464,7 @@ async fn main() {
     let state = AppState {
         config: config.clone(),
         pg,
+        http_metrics: std::sync::Arc::new(crate::common::http_metrics::HttpMetrics::new()),
         cache,
         list_cache,
         auth,
@@ -417,12 +480,13 @@ async fn main() {
         users,
         likes,
         resolve,
+        search,
+        vibe,
         history,
         featured,
         lyrics,
         collab_vector,
         collab_trainer,
-        ltr_trainer,
         indexing,
         recommendations,
         enrich,

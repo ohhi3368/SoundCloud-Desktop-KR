@@ -1,52 +1,55 @@
-"""EMBED_LYRICS: bge-m3 encode text → qdrant tracks_lyrics."""
+"""EMBED_LYRICS: bge-m3 encode text → вектор в шину.
+
+Запись в Qdrant — на бэке (см. AGENTS.md): воркер шлёт вектор в `done.embed_lyrics`.
+"""
 import asyncio
 import json
 import logging
 import time
-
 from nats.aio.client import Client as NATSClient
-from qdrant_client import QdrantClient
 
 from .. import subjects as subj
 from ..models import Models
-from ..storage import has_lyrics_vector, upsert_lyrics
 
 log = logging.getLogger(__name__)
 
 
-def _embed(models: Models, text: str) -> list[float]:
-    vec = models.lyrics_embed.encode(text, normalize_embeddings=True)
-    return vec.tolist()
+def _embed_batch(models: Models, texts: list[str]) -> list[list[float]]:
+    """Один encode на пачку (SentenceTransformer сам маскирует паддинг)."""
+    vecs = models.lyrics_embed.encode(
+        texts, normalize_embeddings=True, batch_size=len(texts)
+    )
+    return [v.tolist() for v in vecs]
 
 
-async def handle(
-    payload: dict,
-    models: Models,
-    qdrant: QdrantClient,
-    nc: NATSClient,
-) -> None:
-    sc_track_id = str(payload["sc_track_id"])
+async def prepare(payload: dict, models: Models) -> dict | None:
+    """None → пропуск пустого/короткого текста."""
     text = (payload.get("text") or "").strip()
-    language = payload.get("language")
-
     if not text or len(text) < 30:
-        log.debug(f"[lyrics] {sc_track_id} empty/short text, skip")
-        await nc.publish(
-            subj.SUBJECT_DONE_EMBED_LYRICS,
-            json.dumps({"sc_track_id": sc_track_id, "skipped": True}).encode(),
-        )
-        return
+        return None
+    return {
+        "sc_track_id": str(payload["sc_track_id"]),
+        "text": text[:4000],
+        "language": payload.get("language"),
+    }
 
-    if has_lyrics_vector(qdrant, sc_track_id):
-        log.info(f"[lyrics] {sc_track_id} already embedded, skip")
-    else:
-        log.info(f"[lyrics] {sc_track_id} embedding ({len(text)} chars)")
-        t0 = time.monotonic()
-        vec = await asyncio.to_thread(_embed, models, text[:4000])
-        upsert_lyrics(qdrant, sc_track_id, vec, language)
-        log.info(f"[lyrics] {sc_track_id} embedded in {time.monotonic() - t0:.2f}s")
 
+def gpu_batch(models: Models, items: list[dict]) -> list[dict]:
+    t0 = time.monotonic()
+    vecs = _embed_batch(models, [p["text"] for p in items])
+    log.info(f"[lyrics] embedded batch×{len(items)} in {time.monotonic() - t0:.2f}s")
+    return [{"vec": v, "language": p.get("language")} for p, v in zip(items, vecs)]
+
+
+async def publish(nc: NATSClient, payload: dict, result: dict) -> None:
+    done_payload: dict = {"sc_track_id": str(payload["sc_track_id"]), "vec": result["vec"]}
+    if result.get("language"):
+        done_payload["language"] = result["language"]
+    await nc.publish(subj.SUBJECT_DONE_EMBED_LYRICS, json.dumps(done_payload).encode())
+
+
+async def publish_skip(nc: NATSClient, payload: dict, _result) -> None:
     await nc.publish(
         subj.SUBJECT_DONE_EMBED_LYRICS,
-        json.dumps({"sc_track_id": sc_track_id}).encode(),
+        json.dumps({"sc_track_id": str(payload["sc_track_id"]), "skipped": True}).encode(),
     )

@@ -16,6 +16,9 @@ const REFRESH_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const FRESH_WINDOW_DAYS: i32 = 14;
 const TAG_PRECOMPUTE_LIMIT: i64 = 32;
 const CACHE_TTL_FALLBACK_SECS: u64 = 3 * 60 * 60;
+// Один наш вовлечённый full_play ≈ INTERNAL_PLAY_WEIGHT пассивных SC-плеев.
+// Поднимает локальных фаворитов над глобальными по SC, не обгоняя реальные хиты.
+const INTERNAL_PLAY_WEIGHT: i64 = 10_000;
 
 pub const REDIS_KEY_SUMMARY: &str = "discover:summary:v1";
 pub const REDIS_KEY_TAGS: &str = "discover:tags:v1";
@@ -43,6 +46,9 @@ pub struct DiscoverService {
     pg: PgPool,
     cache: Arc<CacheService>,
     subscriptions: Arc<SubscriptionsService>,
+    // Process-local single-flight for `refresh_aggregates`: a manual trigger must
+    // not stack bulk catalog UPDATEs on top of the periodic tick, or each other.
+    refresh_lock: tokio::sync::Mutex<()>,
 }
 
 impl DiscoverService {
@@ -55,7 +61,18 @@ impl DiscoverService {
             pg,
             cache,
             subscriptions,
+            refresh_lock: tokio::sync::Mutex::new(()),
         })
+    }
+
+    /// Run `refresh_aggregates` under the single-flight guard. Returns `false`
+    /// (no-op) if a refresh is already in flight on this instance.
+    pub async fn try_refresh_aggregates(&self) -> AppResult<bool> {
+        let Ok(_guard) = self.refresh_lock.try_lock() else {
+            return Ok(false);
+        };
+        self.refresh_aggregates().await?;
+        Ok(true)
     }
 
     pub fn spawn_refresh_loop(self: Arc<Self>, shutdown: CancellationToken) {
@@ -63,15 +80,15 @@ impl DiscoverService {
             let mut tick = tokio::time::interval(REFRESH_TICK);
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             tick.tick().await;
-            if let Err(e) = self.refresh_aggregates().await {
+            if let Err(e) = self.try_refresh_aggregates().await {
                 warn!(error = %e, "discover bootstrap refresh failed");
             }
             loop {
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tick.tick() => {
-                        match tokio::time::timeout(REFRESH_TIMEOUT, self.refresh_aggregates()).await {
-                            Ok(Ok(())) => {}
+                        match tokio::time::timeout(REFRESH_TIMEOUT, self.try_refresh_aggregates()).await {
+                            Ok(Ok(_)) => {}
                             Ok(Err(e)) => warn!(error = %e, "discover refresh failed"),
                             Err(_) => warn!("discover refresh timed out"),
                         }
@@ -85,6 +102,7 @@ impl DiscoverService {
         let started = std::time::Instant::now();
         self.refresh_artist_counts().await?;
         self.refresh_artist_plays().await?;
+        self.refresh_artist_popularity().await?;
         self.refresh_artist_tags().await?;
         self.refresh_artist_star().await?;
         self.refresh_album_meta().await?;
@@ -112,7 +130,7 @@ impl DiscoverService {
                 GROUP BY artist_id
             ),
             featured_counts AS (
-                SELECT artist_id, COUNT(DISTINCT indexed_track_id)::int AS n
+                SELECT artist_id, COUNT(DISTINCT track_id)::int AS n
                 FROM track_artists WHERE role IN ('featured', 'remixer')
                 GROUP BY artist_id
             ),
@@ -163,7 +181,7 @@ impl DiscoverService {
                 SELECT it.primary_artist_id AS artist_id,
                        COUNT(DISTINCT ue.sc_user_id)::bigint AS listeners
                 FROM user_events ue
-                JOIN indexed_tracks it ON it.sc_track_id = ue.sc_track_id
+                JOIN tracks it ON it.sc_track_id = ue.sc_track_id
                 WHERE ue.event_type IN ('full_play', 'like', 'playlist_add')
                   AND ue.created_at > NOW() - INTERVAL '30 days'
                   AND it.primary_artist_id IS NOT NULL
@@ -172,7 +190,7 @@ impl DiscoverService {
             p7_count AS (
                 SELECT it.primary_artist_id AS artist_id, COUNT(*)::bigint AS plays
                 FROM user_events ue
-                JOIN indexed_tracks it ON it.sc_track_id = ue.sc_track_id
+                JOIN tracks it ON it.sc_track_id = ue.sc_track_id
                 WHERE ue.event_type = 'full_play'
                   AND ue.created_at > NOW() - INTERVAL '7 days'
                   AND it.primary_artist_id IS NOT NULL
@@ -181,7 +199,7 @@ impl DiscoverService {
             p30_count AS (
                 SELECT it.primary_artist_id AS artist_id, COUNT(*)::bigint AS plays
                 FROM user_events ue
-                JOIN indexed_tracks it ON it.sc_track_id = ue.sc_track_id
+                JOIN tracks it ON it.sc_track_id = ue.sc_track_id
                 WHERE ue.event_type = 'full_play'
                   AND ue.created_at > NOW() - INTERVAL '30 days'
                   AND it.primary_artist_id IS NOT NULL
@@ -220,6 +238,61 @@ impl DiscoverService {
         Ok(())
     }
 
+    async fn refresh_artist_popularity(&self) -> AppResult<()> {
+        // Гибрид: SC play_count по primary-трекам (база) + наши full_play с
+        // весом INTERNAL_PLAY_WEIGHT. LN-нормализация как у album popularity.
+        sqlx::query(&format!(
+            r#"
+            WITH sc AS (
+                SELECT t.primary_artist_id AS artist_id,
+                       SUM(c.play_count)::bigint AS plays
+                FROM sc_track_counters c
+                JOIN tracks t ON t.sc_track_id = c.sc_track_id
+                WHERE t.primary_artist_id IS NOT NULL
+                GROUP BY t.primary_artist_id
+            ),
+            internal AS (
+                SELECT t.primary_artist_id AS artist_id,
+                       COUNT(*)::bigint AS fp
+                FROM user_events ue
+                JOIN tracks t ON t.sc_track_id = ue.sc_track_id
+                WHERE ue.event_type = 'full_play'
+                  AND t.primary_artist_id IS NOT NULL
+                GROUP BY t.primary_artist_id
+            ),
+            combined AS (
+                SELECT COALESCE(sc.artist_id, internal.artist_id) AS artist_id,
+                       COALESCE(sc.plays, 0)
+                         + COALESCE(internal.fp, 0) * {weight}::bigint AS score
+                FROM sc
+                FULL OUTER JOIN internal ON sc.artist_id = internal.artist_id
+            ),
+            denom AS (
+                SELECT GREATEST(MAX(score), 1)::bigint AS m FROM combined
+            ),
+            affected AS (
+                SELECT artist_id FROM combined WHERE score > 0
+                UNION
+                SELECT id AS artist_id FROM artists
+                WHERE popularity_score > 0 AND merged_into IS NULL
+            )
+            UPDATE artists a SET
+                popularity_score = LEAST(
+                    1.0::real,
+                    (LN(GREATEST(COALESCE(cm.score, 0), 0) + 1)::real
+                     / NULLIF(LN((SELECT m FROM denom) + 1)::real, 0))
+                )
+            FROM affected aff
+            LEFT JOIN combined cm ON cm.artist_id = aff.artist_id
+            WHERE a.id = aff.artist_id AND a.merged_into IS NULL
+            "#,
+            weight = INTERNAL_PLAY_WEIGHT,
+        ))
+        .execute(&self.pg)
+        .await?;
+        Ok(())
+    }
+
     async fn refresh_artist_tags(&self) -> AppResult<()> {
         sqlx::query(
             r#"
@@ -227,7 +300,7 @@ impl DiscoverService {
                 SELECT primary_artist_id AS artist_id,
                        LOWER(TRIM(genre)) AS g,
                        COUNT(*) AS cnt
-                FROM indexed_tracks
+                FROM tracks
                 WHERE primary_artist_id IS NOT NULL
                   AND genre IS NOT NULL
                   AND TRIM(genre) <> ''
@@ -355,7 +428,7 @@ impl DiscoverService {
                        COALESCE(SUM(it.duration_ms), 0)::bigint AS total_ms,
                        MIN(it.release_date) AS earliest_release
                 FROM album_tracks at
-                JOIN indexed_tracks it ON it.id = at.indexed_track_id
+                JOIN tracks it ON it.id = at.track_id
                 GROUP BY at.album_id
             ),
             affected AS (
@@ -385,7 +458,7 @@ impl DiscoverService {
             WITH album_plays AS (
                 SELECT at.album_id, SUM(COALESCE(c.play_count, 0))::bigint AS plays
                 FROM album_tracks at
-                JOIN indexed_tracks it ON it.id = at.indexed_track_id
+                JOIN tracks it ON it.id = at.track_id
                 LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id
                 GROUP BY at.album_id
             ),
@@ -439,13 +512,21 @@ impl DiscoverService {
     }
 
     pub async fn compute_summary(&self) -> AppResult<CachedSummary> {
+        // artists_count/albums_count/fresh_count считаем по тому же гейту, что и
+        // каталог — иначе бейдж таба завышает на мусоре (артисты без треков,
+        // альбомы без плеев), которого в самом каталоге нет.
         let (artists_count, albums_count, fresh_count): (i64, i64, i64) = sqlx::query_as(
             r#"SELECT
-                COALESCE((SELECT reltuples::bigint FROM pg_class WHERE relname = 'artists'), 0)
-                    - (SELECT COUNT(*)::bigint FROM artists WHERE merged_into IS NOT NULL),
-                COALESCE((SELECT reltuples::bigint FROM pg_class WHERE relname = 'albums'), 0),
+                (SELECT COUNT(*)::bigint FROM artists
+                  WHERE merged_into IS NULL
+                    AND (track_count_primary > 0 OR track_count_featured > 0)),
                 (SELECT COUNT(*)::bigint FROM albums
-                  WHERE release_date IS NOT NULL
+                  WHERE track_count > 0 AND popularity_score > 0
+                    AND primary_artist_id IS NOT NULL),
+                (SELECT COUNT(*)::bigint FROM albums
+                  WHERE track_count > 0 AND popularity_score > 0
+                    AND primary_artist_id IS NOT NULL
+                    AND release_date IS NOT NULL
                     AND release_date > (CURRENT_DATE - ($1::int * INTERVAL '1 day')))
             "#,
         )

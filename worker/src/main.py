@@ -1,11 +1,4 @@
-"""Воркер = только AI-слой. Shina — NATS (JetStream). HTTP/Redis не используются.
-
-- Все задачи идут через JetStream pull-consumer'ы.
-- Глобальный семафор `inference_sem(1)` гарантирует: один воркер = один инференс за раз.
-  Пока семафор занят, воркер НЕ делает fetch — сообщения остаются в стриме и подхватываются
-  другими воркерами (queue group через общий durable).
-- Подтверждение "я работаю" раз в TASK_HEARTBEAT_SEC, жёсткий таймаут TASK_HARD_TIMEOUT_SEC.
-"""
+"""Воркер = AI-слой над NATS (JetStream). Параллелизм — WORKER_CONCURRENCY. См. AGENTS.md."""
 import asyncio
 import logging
 import os
@@ -13,100 +6,43 @@ import signal
 import threading
 
 from . import subjects as subj
-from .bus import connect, ensure_consumer, run_rpc_msg, run_with_lifecycle
+from .bus import connect, ensure_consumer
+from .config import (
+    BATCH_WAIT_MS,
+    LYRICS_BATCH,
+    TRANSCRIBE_HARD_TIMEOUT_SEC,
+    WORKER_CONCURRENCY,
+)
 from .handlers import ai, audio, lyrics
 from .handlers import collab as collab_handler
-from .handlers import ltr as ltr_handler
+from .handlers import encode as encode_handler
 from .handlers import quality as quality_handler
-from .handlers import sequential as sequential_handler
-from .handlers import two_tower as two_tower_handler
+from .handlers import transcribe as transcribe_handler
 from .handlers.resolve import match_track, resolve_artist, verify_existence
-from .handlers.transcribe import transcribe
 from .models import load_all
-from .storage import ensure_collections, new_client
+from .runner import run_batched_lane, run_concurrent_lane
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 for noisy in ("httpx", "httpcore", "urllib3", "huggingface_hub", "filelock"):
     logging.getLogger(noisy).setLevel(logging.WARNING)
 log = logging.getLogger(__name__)
 
+TAGS = ("ai", "audio", "lyrics", "collab", "quality", "transcribe")
 
-async def _js_pull_loop(
-    js,
-    sem: asyncio.Semaphore,
-    stream: str,
-    durable: str,
-    subject: str,
-    handler_factory,
-    tag: str,
-    stop: asyncio.Event,
-    *,
-    is_rpc: bool,
-    nc=None,
-) -> None:
-    """Пока inference_sem занят — не вызываем fetch, сообщения достаются другим воркерам.
 
-    После N подряд ошибок fetch (обычно — обрыв NATS) пересоздаём подписку,
-    иначе зомби-psub будет вечно отдавать ошибки даже после реконнекта коннекта.
-    """
-    psub = await js.pull_subscribe(subject, durable=durable)
-    log.info(f"JS pull-consumer started: {stream}/{durable} → {subject}")
-    err_streak = 0
-
-    while not stop.is_set():
-        await sem.acquire()
-        try:
-            try:
-                msgs = await psub.fetch(batch=1, timeout=1)
-                err_streak = 0
-            except asyncio.TimeoutError:
-                sem.release()
-                continue
-            except asyncio.CancelledError:
-                sem.release()
-                raise
-            except Exception as e:
-                if stop.is_set():
-                    sem.release()
-                    return
-                err_streak += 1
-                log.error(f"{tag} fetch failed ({err_streak}): {e}")
-                sem.release()
-                if err_streak >= 5:
-                    log.warning(f"{tag} resubscribing after {err_streak} fetch errors")
-                    try:
-                        await psub.unsubscribe()
-                    except Exception:
-                        pass
-                    try:
-                        psub = await js.pull_subscribe(subject, durable=durable)
-                        err_streak = 0
-                        log.info(f"{tag} resubscribed")
-                    except Exception as e2:
-                        log.error(f"{tag} resubscribe failed: {e2}")
-                try:
-                    await asyncio.wait_for(stop.wait(), timeout=1)
-                    return
-                except asyncio.TimeoutError:
-                    continue
-
-            if not msgs:
-                sem.release()
-                continue
-
-            for msg in msgs:
-                if is_rpc:
-                    await run_rpc_msg(msg, handler_factory, tag, nc)
-                else:
-                    await run_with_lifecycle(msg, handler_factory, tag)
-        except BaseException:
-            try:
-                sem.release()
-            except ValueError:
-                pass
-            raise
-        else:
-            sem.release()
+def _build_concurrency() -> tuple[dict[str, int], set[str]]:
+    """{tag: N} + множество включённых тэгов (N>0). Глобальный int → N на каждый тэг."""
+    cfg = WORKER_CONCURRENCY
+    if isinstance(cfg, int):
+        conc = {tag: cfg for tag in TAGS}
+    else:
+        conc = {tag: cfg.get(tag, 1) for tag in TAGS}
+    enabled = {t for t, n in conc.items() if n > 0}
+    log.info(
+        "WORKER_CONCURRENCY: "
+        + ", ".join(f"{t}={conc[t]}" + (" [OFF]" if conc[t] == 0 else "") for t in TAGS)
+    )
+    return conc, enabled
 
 
 def _route_ai(models, subject: str, payload: dict):
@@ -116,22 +52,12 @@ def _route_ai(models, subject: str, payload: dict):
         return ai.search_queries(models, payload)
     if subject == subj.AI_RANK_LYRICS:
         return ai.rank_lyrics(models, payload)
-    if subject == subj.AI_TRANSCRIBE:
-        return transcribe(models, payload)
-    if subject == subj.AI_ENCODE_TEXT_MULAN:
-        return ai.encode_text_mulan(models, payload)
-    if subject == subj.AI_LTR_SCORE:
-        return ltr_handler.score(models, payload)
     if subject == subj.AI_RESOLVE_ARTIST:
         return resolve_artist(models, payload)
     if subject == subj.AI_VERIFY_EXISTENCE:
         return verify_existence(models, payload)
     if subject == subj.AI_MATCH_TRACK:
         return match_track(models, payload)
-    if subject == subj.AI_TWO_TOWER_SCORE:
-        return two_tower_handler.score(models, payload)
-    if subject == subj.AI_SEQUENTIAL_PREDICT:
-        return sequential_handler.predict(models, payload)
     if subject == subj.AI_QUALITY_SCORE:
         return quality_handler.score(models, payload)
     raise ValueError(f"unknown AI subject: {subject}")
@@ -141,47 +67,44 @@ async def main() -> None:
     nc = await connect()
     js = nc.jetstream()
 
-    models = load_all()
-    qdrant = new_client()
-    ensure_collections(qdrant)
+    conc, enabled = _build_concurrency()
+    if not enabled:
+        log.error("All tags disabled in WORKER_CONCURRENCY — nothing to do, exiting.")
+        return
 
-    # Стримы создаёт backend. Воркер только добавляет свои consumer'ы.
-    await ensure_consumer(
-        js, subj.STREAM_AI_RPC, subj.DURABLE_AI_RPC, subj.SUBJECT_AI_RPC_FILTER,
-    )
-    await ensure_consumer(
-        js, subj.STREAM_INDEX_AUDIO, subj.DURABLE_INDEX_AUDIO, subj.SUBJECT_INDEX_AUDIO_NEW
-    )
-    await ensure_consumer(
-        js, subj.STREAM_EMBED_LYRICS, subj.DURABLE_EMBED_LYRICS, subj.SUBJECT_EMBED_LYRICS_NEW
-    )
-    await ensure_consumer(
-        js, subj.STREAM_TRAIN_COLLAB, subj.DURABLE_TRAIN_COLLAB, subj.SUBJECT_TRAIN_COLLAB_NEW
-    )
-    await ensure_consumer(
-        js, subj.STREAM_TRAIN_LTR, subj.DURABLE_TRAIN_LTR, subj.SUBJECT_TRAIN_LTR_NEW
-    )
-    await ensure_consumer(
-        js,
-        subj.STREAM_TRAIN_TWO_TOWER,
-        subj.DURABLE_TRAIN_TWO_TOWER,
-        subj.SUBJECT_TRAIN_TWO_TOWER_NEW,
-    )
-    await ensure_consumer(
-        js,
-        subj.STREAM_TRAIN_SEQUENTIAL,
-        subj.DURABLE_TRAIN_SEQUENTIAL,
-        subj.SUBJECT_TRAIN_SEQUENTIAL_NEW,
-    )
-    await ensure_consumer(
-        js,
-        subj.STREAM_TRAIN_QUALITY,
-        subj.DURABLE_TRAIN_QUALITY,
-        subj.SUBJECT_TRAIN_QUALITY_NEW,
-    )
+    models = load_all(enabled)
+
+    # Стримы создаёт backend. Воркер регистрирует только consumer'ы активных тэгов.
+    if "ai" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_AI_RPC, subj.DURABLE_AI_RPC, subj.SUBJECT_AI_RPC_FILTER
+        )
+        # Энкод-лейн делит модели (mulan / bge-m3) с ai-тэгом → гейтится им же.
+        await ensure_consumer(
+            js, subj.STREAM_ENCODE, subj.DURABLE_ENCODE, subj.SUBJECT_ENCODE_NEW
+        )
+    if "audio" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_INDEX_AUDIO, subj.DURABLE_INDEX_AUDIO, subj.SUBJECT_INDEX_AUDIO_NEW
+        )
+    if "lyrics" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_EMBED_LYRICS, subj.DURABLE_EMBED_LYRICS, subj.SUBJECT_EMBED_LYRICS_NEW
+        )
+    if "collab" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_TRAIN_COLLAB, subj.DURABLE_TRAIN_COLLAB, subj.SUBJECT_TRAIN_COLLAB_NEW
+        )
+    if "quality" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_TRAIN_QUALITY, subj.DURABLE_TRAIN_QUALITY, subj.SUBJECT_TRAIN_QUALITY_NEW
+        )
+    if "transcribe" in enabled:
+        await ensure_consumer(
+            js, subj.STREAM_TRANSCRIBE, subj.DURABLE_TRANSCRIBE, subj.SUBJECT_TRANSCRIBE_NEW
+        )
 
     stop = asyncio.Event()
-    inference_sem = asyncio.Semaphore(1)
 
     def _signal(*_):
         if stop.is_set():
@@ -189,8 +112,7 @@ async def main() -> None:
             os._exit(0)
         log.info("signal received, stopping")
         stop.set()
-        # Hard deadline: if we're still alive after 5s, something is blocked
-        # in C-extension code (torch, demucs) that ignores asyncio cancel.
+        # Hard deadline: если живы через 5с — что-то залипло в C-ext (torch/demucs).
         threading.Timer(5.0, lambda: os._exit(0)).start()
 
     loop = asyncio.get_running_loop()
@@ -200,87 +122,87 @@ async def main() -> None:
         except NotImplementedError:
             pass
 
-    ai_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_AI_RPC, subj.DURABLE_AI_RPC,
-            subj.SUBJECT_AI_RPC_FILTER,
-            lambda subject, payload: _route_ai(models, subject, payload),
-            "[ai]", stop, is_rpc=True, nc=nc,
-        )
-    )
-    audio_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_INDEX_AUDIO, subj.DURABLE_INDEX_AUDIO,
-            subj.SUBJECT_INDEX_AUDIO_NEW,
-            lambda p: audio.handle(p, models, qdrant, nc),
-            "[audio]", stop, is_rpc=False,
-        )
-    )
-    lyrics_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_EMBED_LYRICS, subj.DURABLE_EMBED_LYRICS,
-            subj.SUBJECT_EMBED_LYRICS_NEW,
-            lambda p: lyrics.handle(p, models, qdrant, nc),
-            "[lyrics]", stop, is_rpc=False,
-        )
-    )
-    collab_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_TRAIN_COLLAB, subj.DURABLE_TRAIN_COLLAB,
-            subj.SUBJECT_TRAIN_COLLAB_NEW,
-            lambda p: collab_handler.handle(p, models, qdrant, nc),
-            "[collab]", stop, is_rpc=False,
-        )
-    )
-    ltr_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_TRAIN_LTR, subj.DURABLE_TRAIN_LTR,
-            subj.SUBJECT_TRAIN_LTR_NEW,
-            lambda p: ltr_handler.handle(p, models, qdrant, nc),
-            "[ltr]", stop, is_rpc=False,
-        )
-    )
-    two_tower_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_TRAIN_TWO_TOWER, subj.DURABLE_TRAIN_TWO_TOWER,
-            subj.SUBJECT_TRAIN_TWO_TOWER_NEW,
-            lambda p: two_tower_handler.handle(p, models, qdrant, nc),
-            "[two_tower]", stop, is_rpc=False,
-        )
-    )
-    sequential_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_TRAIN_SEQUENTIAL, subj.DURABLE_TRAIN_SEQUENTIAL,
-            subj.SUBJECT_TRAIN_SEQUENTIAL_NEW,
-            lambda p: sequential_handler.handle(p, models, qdrant, nc),
-            "[sequential]", stop, is_rpc=False,
-        )
-    )
-    quality_task = asyncio.create_task(
-        _js_pull_loop(
-            js, inference_sem, subj.STREAM_TRAIN_QUALITY, subj.DURABLE_TRAIN_QUALITY,
-            subj.SUBJECT_TRAIN_QUALITY_NEW,
-            lambda p: quality_handler.handle(p, models, qdrant, nc),
-            "[quality]", stop, is_rpc=False,
-        )
-    )
+    # GPU-лок нужен, только когда ai шарит модель с батч-лейном (иначе один владелец).
+    ai_on = "ai" in enabled
+    audio_gpu_lock = models.mulan_lock if ai_on else None
+    lyrics_gpu_lock = models.lyrics_text_lock if ai_on else None
 
-    log.info("Worker ready.")
+    tasks: list[asyncio.Task] = []
+    if "ai" in enabled:
+        tasks.append(asyncio.create_task(
+            run_concurrent_lane(
+                js, asyncio.Semaphore(conc["ai"]), subj.STREAM_AI_RPC, subj.DURABLE_AI_RPC,
+                subj.SUBJECT_AI_RPC_FILTER,
+                lambda subject, payload: _route_ai(models, subject, payload),
+                "[ai]", stop, is_rpc=True, nc=nc,
+            )
+        ))
+        # Энкод запросов — отдельный work-queue лейн (НЕ rpc): считает вектор и
+        # публикует done.encode. Делит GPU-локи mulan/bge-m3 с ai-лейном.
+        tasks.append(asyncio.create_task(
+            run_concurrent_lane(
+                js, asyncio.Semaphore(conc["ai"]), subj.STREAM_ENCODE, subj.DURABLE_ENCODE,
+                subj.SUBJECT_ENCODE_NEW,
+                lambda p: encode_handler.handle(p, models, nc),
+                "[encode]", stop, is_rpc=False, nc=nc,
+            )
+        ))
+    if "audio" in enabled:
+        tasks.append(asyncio.create_task(
+            run_batched_lane(
+                js, models, nc,
+                stream=subj.STREAM_INDEX_AUDIO, durable=subj.DURABLE_INDEX_AUDIO,
+                subject=subj.SUBJECT_INDEX_AUDIO_NEW, tag="[audio]", stop=stop,
+                prepare=audio.prepare, gpu_batch=audio.gpu_batch, publish=audio.publish,
+                fanout=conc["audio"], max_batch=1, wait_ms=0, gpu_lock=audio_gpu_lock,
+            )
+        ))
+    if "lyrics" in enabled:
+        tasks.append(asyncio.create_task(
+            run_batched_lane(
+                js, models, nc,
+                stream=subj.STREAM_EMBED_LYRICS, durable=subj.DURABLE_EMBED_LYRICS,
+                subject=subj.SUBJECT_EMBED_LYRICS_NEW, tag="[lyrics]", stop=stop,
+                prepare=lyrics.prepare, gpu_batch=lyrics.gpu_batch, publish=lyrics.publish,
+                publish_skip=lyrics.publish_skip,
+                fanout=conc["lyrics"], max_batch=LYRICS_BATCH, wait_ms=BATCH_WAIT_MS,
+                gpu_lock=lyrics_gpu_lock,
+            )
+        ))
+    if "collab" in enabled:
+        tasks.append(asyncio.create_task(
+            run_concurrent_lane(
+                js, asyncio.Semaphore(conc["collab"]), subj.STREAM_TRAIN_COLLAB,
+                subj.DURABLE_TRAIN_COLLAB, subj.SUBJECT_TRAIN_COLLAB_NEW,
+                lambda p: collab_handler.handle(p, models, nc),
+                "[collab]", stop, is_rpc=False,
+            )
+        ))
+    if "quality" in enabled:
+        tasks.append(asyncio.create_task(
+            run_concurrent_lane(
+                js, asyncio.Semaphore(conc["quality"]), subj.STREAM_TRAIN_QUALITY,
+                subj.DURABLE_TRAIN_QUALITY, subj.SUBJECT_TRAIN_QUALITY_NEW,
+                lambda p: quality_handler.handle(p, models, nc),
+                "[quality]", stop, is_rpc=False,
+            )
+        ))
+    if "transcribe" in enabled:
+        tasks.append(asyncio.create_task(
+            run_concurrent_lane(
+                js, asyncio.Semaphore(conc["transcribe"]), subj.STREAM_TRANSCRIBE,
+                subj.DURABLE_TRANSCRIBE, subj.SUBJECT_TRANSCRIBE_NEW,
+                lambda p: transcribe_handler.handle(p, models, nc),
+                "[transcribe]", stop, is_rpc=False, hard_timeout=TRANSCRIBE_HARD_TIMEOUT_SEC,
+            )
+        ))
+
+    log.info(f"Worker ready ({len(tasks)} lanes active).")
     await stop.wait()
 
-    ai_task.cancel()
-    audio_task.cancel()
-    lyrics_task.cancel()
-    collab_task.cancel()
-    ltr_task.cancel()
-    two_tower_task.cancel()
-    sequential_task.cancel()
-    quality_task.cancel()
-    await asyncio.gather(
-        ai_task, audio_task, lyrics_task, collab_task, ltr_task,
-        two_tower_task, sequential_task, quality_task,
-        return_exceptions=True,
-    )
+    for t in tasks:
+        t.cancel()
+    await asyncio.gather(*tasks, return_exceptions=True)
     try:
         await asyncio.wait_for(nc.drain(), timeout=2)
     except (asyncio.TimeoutError, Exception) as e:

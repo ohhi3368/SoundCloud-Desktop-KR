@@ -1,6 +1,7 @@
 import React from 'react';
-import { Star } from '../../lib/icons';
-import type { Aura } from '../../lib/aura';
+import type {Aura} from '../../lib/aura';
+import {Star} from '../../lib/icons';
+import {usePerfMode} from '../../lib/perf';
 
 export type StarSeed = {
   i: number;
@@ -50,15 +51,23 @@ interface StarFieldProps {
   aura: Aura;
   seeds: StarSeed[];
   intensity?: number;
+    /** Per-star glow (drop-shadow/box-shadow). Off for cheaper pages. Default on. */
+    glow?: boolean;
 }
 
-function StarFieldImpl({ aura, seeds, intensity = 1 }: StarFieldProps) {
+function StarFieldImpl({aura, seeds, intensity = 1, glow = true}: StarFieldProps) {
+    const perf = usePerfMode();
+    const allowGlow = glow && perf.glow;
+    const dots = DOT_SEEDS.slice(0, perf.particles(DOT_SEEDS.length));
+    const stars = seeds.slice(0, perf.particles(seeds.length));
+    if (dots.length === 0 && stars.length === 0) return null;
+
   return (
     <div
       className="absolute inset-0 pointer-events-none overflow-hidden"
       style={{ contain: 'strict', transform: 'translateZ(0)' }}
     >
-      {DOT_SEEDS.map((d) => {
+        {dots.map((d) => {
         const color = aura.orbs[d.i % 3];
         return (
           <div
@@ -71,16 +80,18 @@ function StarFieldImpl({ aura, seeds, intensity = 1 }: StarFieldProps) {
                 left: `${d.left}%`,
                 top: `${d.top}%`,
                 background: color,
-                boxShadow: `0 0 ${d.size * 2}px ${color}`,
+                  boxShadow: allowGlow ? `0 0 ${d.size * 2}px ${color}` : undefined,
                 ['--min' as keyof React.CSSProperties]: d.min * intensity,
                 ['--max' as keyof React.CSSProperties]: d.max * intensity,
-                animation: `star-twinkle ${d.duration}s ease-in-out ${d.delay}s infinite`,
+                  animation: perf.idleAnim
+                      ? `star-twinkle ${d.duration}s ease-in-out ${d.delay}s infinite`
+                      : undefined,
               } as React.CSSProperties
             }
           />
         );
       })}
-      {seeds.map((s) => {
+        {stars.map((s) => {
         const color = aura.orbs[s.i % 3];
         return (
           <div
@@ -92,10 +103,12 @@ function StarFieldImpl({ aura, seeds, intensity = 1 }: StarFieldProps) {
                 top: `${s.top}%`,
                 color,
                 transform: `rotate(${s.rot}deg)`,
-                filter: `drop-shadow(0 0 ${s.size}px ${color})`,
+                  filter: allowGlow ? `drop-shadow(0 0 ${s.size}px ${color})` : undefined,
                 ['--min' as keyof React.CSSProperties]: s.min * intensity,
                 ['--max' as keyof React.CSSProperties]: s.max * intensity,
-                animation: `star-twinkle ${s.duration}s ease-in-out ${s.delay}s infinite`,
+                  animation: perf.idleAnim
+                      ? `star-twinkle ${s.duration}s ease-in-out ${s.delay}s infinite`
+                      : undefined,
               } as React.CSSProperties
             }
           >

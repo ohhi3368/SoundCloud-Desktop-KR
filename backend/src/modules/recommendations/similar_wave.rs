@@ -8,13 +8,16 @@ use crate::modules::centroids::cosine;
 use crate::qdrant::collections;
 
 use super::clusters::{pick_unique_ids, ClusterBuilder, ClusterNeighbor, ClusterResponse};
+use super::home_wave::merge_audio_pools;
 use super::service::util::parse_id_or_null;
 use super::service::RecommendationsService;
+use super::smart_wave::{self, SmartWaveSeed};
 
-const SAME_ARTIST_POOL: i64 = 50;
-const FEATURED_LIMIT: i64 = 6;
-const FANS_ALSO_LIMIT: usize = 80;
-const SAME_VIBE_POOL: usize = 80;
+const SAME_ARTIST_POOL: i64 = 60;
+const FEATURED_LIMIT: i64 = 8;
+const FANS_ALSO_LIMIT: usize = 120;
+const SAME_VIBE_POOL: usize = 160;
+const WAVE_LIMIT: usize = 24;
 
 #[derive(Debug, sqlx::FromRow)]
 struct ArtistTrackRow {
@@ -33,6 +36,7 @@ impl RecommendationsService {
     pub async fn similar_wave(
         &self,
         sc_track_id: &str,
+        sc_user_id: &str,
         languages: Option<&[String]>,
         per_cluster: usize,
     ) -> AppResult<ClusterResponse> {
@@ -46,9 +50,19 @@ impl RecommendationsService {
 
         let seed = self.load_track_vectors(anchor).await;
         let mert_seed = seed.mert.clone();
+        let clap_seed = seed.clap.clone();
+        let lyrics_seed = seed.lyrics.clone();
         let collab_seed = seed.collab.clone();
 
         let exclude: Vec<String> = vec![sc_track_id.to_string()];
+
+        let wave_fut = smart_wave::cluster_track_ids(
+            self,
+            sc_user_id,
+            languages,
+            SmartWaveSeed::Track(anchor),
+            WAVE_LIMIT,
+        );
 
         let same_artist_fut = async {
             match primary_artist {
@@ -66,9 +80,9 @@ impl RecommendationsService {
         };
 
         let same_vibe_fut = async {
-            match &mert_seed {
-                Some(v) => {
-                    let filter = self.build_filter(&exclude, languages);
+            let filter = self.build_filter(&exclude, languages);
+            let mert_fut = async {
+                if let Some(v) = &mert_seed {
                     self.search_by_vector(
                         collections::TRACKS_MERT,
                         v,
@@ -76,9 +90,38 @@ impl RecommendationsService {
                         SAME_VIBE_POOL,
                     )
                     .await
+                } else {
+                    Vec::new()
                 }
-                None => Vec::new(),
-            }
+            };
+            let clap_fut = async {
+                if let Some(v) = &clap_seed {
+                    self.search_by_vector(
+                        collections::TRACKS_CLAP,
+                        v,
+                        filter.as_ref(),
+                        SAME_VIBE_POOL / 2,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                }
+            };
+            let lyrics_fut = async {
+                if let Some(v) = &lyrics_seed {
+                    self.search_by_vector(
+                        collections::TRACKS_LYRICS,
+                        v,
+                        filter.as_ref(),
+                        SAME_VIBE_POOL / 2,
+                    )
+                    .await
+                } else {
+                    Vec::new()
+                }
+            };
+            let (mert_pool, clap_pool, lyrics_pool) = tokio::join!(mert_fut, clap_fut, lyrics_fut);
+            merge_audio_pools(&mert_pool, &clap_pool, &lyrics_pool)
         };
 
         let featured_fut = self.load_featured_with(sc_track_id, FEATURED_LIMIT);
@@ -99,12 +142,18 @@ impl RecommendationsService {
             }
         };
 
-        let (same_artist_ids, same_vibe_pool, featured_raw, fans_also_pool) =
-            tokio::join!(same_artist_fut, same_vibe_fut, featured_fut, fans_also_fut);
+        let (wave_ids, same_artist_ids, same_vibe_pool, featured_raw, fans_also_pool) = tokio::join!(
+            wave_fut,
+            same_artist_fut,
+            same_vibe_fut,
+            featured_fut,
+            fans_also_fut,
+        );
 
         let mut builder = ClusterBuilder::new();
         builder.reserve(std::iter::once(sc_track_id.to_string()));
 
+        builder.push("wave", wave_ids);
         builder.push("same_artist", same_artist_ids);
 
         let same_vibe_artist: Option<Uuid> = primary_artist;
@@ -132,7 +181,7 @@ impl RecommendationsService {
         let result = builder.finish();
         super::impressions::log_clusters_async(
             self.pg.clone(),
-            String::new(),
+            sc_user_id.to_string(),
             super::impressions::ImpressionSource::Similar,
             &result.clusters,
             &std::collections::HashMap::new(),
@@ -147,7 +196,7 @@ impl RecommendationsService {
 
     async fn load_primary_artist_id(&self, sc_track_id: &str) -> Option<Uuid> {
         sqlx::query_as::<_, PrimaryArtistRow>(
-            "SELECT primary_artist_id FROM indexed_tracks
+            "SELECT primary_artist_id FROM tracks
              WHERE sc_track_id = $1 AND primary_artist_id IS NOT NULL
              LIMIT 1",
         )
@@ -169,11 +218,11 @@ impl RecommendationsService {
         let rows: Vec<(String,)> = sqlx::query_as(
             "SELECT it.sc_track_id
              FROM track_artists ta
-             JOIN indexed_tracks it ON it.id = ta.indexed_track_id
+             JOIN tracks it ON it.id = ta.track_id
              LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id
              WHERE ta.artist_id = $1
                AND ta.role = 'primary'
-               AND it.indexed_at IS NOT NULL
+               AND it.sharing = 'public'
                AND it.sc_track_id <> $2
              ORDER BY COALESCE(c.play_count, 0) DESC
              LIMIT $3",
@@ -211,16 +260,16 @@ impl RecommendationsService {
         let rows: Vec<ArtistTrackRow> = sqlx::query_as::<_, ArtistTrackRow>(
             "WITH anchor_artists AS (
                  SELECT artist_id FROM track_artists ta
-                 JOIN indexed_tracks it ON it.id = ta.indexed_track_id
+                 JOIN tracks it ON it.id = ta.track_id
                  WHERE it.sc_track_id = $1
              ),
              feat_artists AS (
                  SELECT DISTINCT ta.artist_id
                  FROM track_artists ta
-                 JOIN indexed_tracks it ON it.id = ta.indexed_track_id
+                 JOIN tracks it ON it.id = ta.track_id
                  WHERE ta.role IN ('featured', 'remixer')
                    AND it.id IN (
-                       SELECT indexed_track_id FROM track_artists
+                       SELECT track_id FROM track_artists
                        WHERE artist_id IN (SELECT artist_id FROM anchor_artists)
                    )
                    AND ta.artist_id NOT IN (SELECT artist_id FROM anchor_artists)
@@ -234,10 +283,10 @@ impl RecommendationsService {
                      ) AS rn
                  FROM feat_artists fa
                  JOIN track_artists ta ON ta.artist_id = fa.artist_id AND ta.role = 'primary'
-                 JOIN indexed_tracks it ON it.id = ta.indexed_track_id
+                 JOIN tracks it ON it.id = ta.track_id
                  LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id
-                 WHERE it.indexed_at IS NOT NULL
-                   AND it.sc_track_id <> $1
+                 WHERE it.sc_track_id <> $1
+                   AND it.sharing = 'public'
              )
              SELECT a.id AS artist_id, a.name AS artist_name, a.avatar_url, r.sc_track_id
              FROM ranked r

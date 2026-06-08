@@ -1,13 +1,14 @@
-"""AI RPC: detect_language, search_queries, rank_lyrics, encode_text_mulan.
+"""AI RPC: detect_language, search_queries, rank_lyrics.
 
-Транскрибация вынесена в transcribe.py — там тяжёлый pipeline с demucs + whisper.
+encode_text_mulan / encode_lyrics_text живут здесь же, но дёргаются не как RPC, а
+из encode-лейна (work-queue → done.encode, см. handlers/encode.py). Транскрибация
+вынесена в transcribe.py — там тяжёлый pipeline с demucs + whisper.
 """
 import asyncio
 import gc
 import json
 import logging
 import re
-
 import torch
 
 from ..models import DEVICE, Models, ensure_mini
@@ -150,6 +151,21 @@ async def encode_text_mulan(models: Models, payload: dict) -> dict:
         return await asyncio.to_thread(_run)
 
 
+async def encode_lyrics_text(models: Models, payload: dict) -> dict:
+    """bge-m3 (тот же резидентный эмбеддер, что индексирует лирику) → 1024-dim вектор
+    для семантического поиска по текстам песен."""
+    text = (payload.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is empty")
+
+    def _run() -> dict:
+        vec = models.lyrics_embed.encode(text, normalize_embeddings=True)
+        return {"vector": vec.astype("float32").tolist()}
+
+    async with models.lyrics_text_lock:
+        return await asyncio.to_thread(_run)
+
+
 async def detect_language(models: Models, payload: dict) -> dict:
     text = (payload.get("text") or "").strip()
     if not text:
@@ -232,4 +248,8 @@ async def rank_lyrics(models: Models, payload: dict) -> dict:
             log.warning(f"[ai] rank_lyrics failed: {e}")
             return {"best_idx": candidates[0].get("idx", 0), "score": 0, "error": str(e)}
 
-    return await asyncio.to_thread(_run)
+    # Тот же резидентный bge-m3, что encode_lyrics_text и lyrics-батч-лейн —
+    # сериализуем форвард тем же локом, иначе конкурентные CUDA-форварды на одном
+    # модуле (ai-rpc vs батч) могут портить состояние/вектора.
+    async with models.lyrics_text_lock:
+        return await asyncio.to_thread(_run)

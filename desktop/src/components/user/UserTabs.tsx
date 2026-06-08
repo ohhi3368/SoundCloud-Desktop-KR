@@ -1,9 +1,12 @@
 import React, { useCallback } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
+import type { Aura } from '../../lib/aura';
 import { fc } from '../../lib/formatters';
 import {
   useInfiniteScroll,
+  useSearchDbPlaylists,
+  useSearchDbTracks,
   useUserFollowers,
   useUserFollowings,
   useUserLikedTracks,
@@ -12,11 +15,11 @@ import {
   useUserTracks,
 } from '../../lib/hooks';
 import { Loader2, Music } from '../../lib/icons';
+import {usePerfMode} from '../../lib/perf';
 import { PlaylistCard } from '../music/PlaylistCard';
 import { Avatar } from '../ui/Avatar';
 import { VirtualGrid } from '../ui/VirtualGrid';
 import { VirtualList } from '../ui/VirtualList';
-import type { Aura } from '../../lib/aura';
 import { ThemedTrackRow } from './ThemedTrackRow';
 
 interface TabWrapperProps {
@@ -155,6 +158,84 @@ export function UserLikesTab({ urn, aura }: { urn: string; aura: Aura }) {
   );
 }
 
+/**
+ * Поиск треков юзера в нашей базе (`/search/db/tracks?user_urn=...`). Идёт
+ * только локально — на SC нет API "tracks этого юзера с подстрочным q=".
+ * Рендер совместим с обычным UserTracksTab, чтобы UI не "прыгал" при
+ * включении/выключении поиска.
+ */
+export function UserSearchTracksTab({
+  urn,
+  aura,
+  query,
+}: {
+  urn: string;
+  aura: Aura;
+  query: string;
+}) {
+  const { t } = useTranslation();
+  const q = useSearchDbTracks(query, urn);
+  const ref = useInfiniteScroll(!!q.hasNextPage, !!q.isFetchingNextPage, q.fetchNextPage);
+  const renderItem = useCallback(
+    (track: (typeof q.tracks)[number], i: number) => (
+      <ThemedTrackRow track={track} index={i} queue={q.tracks} aura={aura} />
+    ),
+    [aura, q.tracks],
+  );
+  return (
+    <TabWrapper
+      isLoading={q.isLoading}
+      isEmpty={q.tracks.length === 0}
+      emptyText={t('user.search.empty')}
+    >
+      <VirtualList
+        items={q.tracks}
+        rowHeight={72}
+        overscan={8}
+        className="flex flex-col gap-1"
+        getItemKey={(t) => t.urn}
+        renderItem={renderItem}
+      />
+      <div ref={ref} className="h-16 flex items-center justify-center">
+        {q.isFetchingNextPage && <Loader2 size={20} className="text-white/20 animate-spin" />}
+      </div>
+    </TabWrapper>
+  );
+}
+
+/**
+ * Поиск плейлистов юзера в нашей базе. Та же логика, что и Tracks-вариант.
+ */
+export function UserSearchPlaylistsTab({ urn, query }: { urn: string; query: string }) {
+  const { t } = useTranslation();
+  const q = useSearchDbPlaylists(query, urn);
+  const ref = useInfiniteScroll(!!q.hasNextPage, !!q.isFetchingNextPage, q.fetchNextPage);
+  const renderItem = useCallback(
+    (p: (typeof q.playlists)[number]) => <PlaylistCard playlist={p} showPlayback />,
+    [],
+  );
+  return (
+    <TabWrapper
+      isLoading={q.isLoading}
+      isEmpty={q.playlists.length === 0}
+      emptyText={t('user.search.empty')}
+    >
+      <VirtualGrid
+        items={q.playlists}
+        itemHeight={320}
+        minColumnWidth={200}
+        gap={28}
+        overscan={3}
+        getItemKey={(p, i) => `${p.urn}-${i}`}
+        renderItem={renderItem}
+      />
+      <div ref={ref} className="h-16 flex items-center justify-center">
+        {q.isFetchingNextPage && <Loader2 size={20} className="text-white/20 animate-spin" />}
+      </div>
+    </TabWrapper>
+  );
+}
+
 export function UserConnectionsTab({
   urn,
   mode,
@@ -164,6 +245,7 @@ export function UserConnectionsTab({
 }) {
   const { t } = useTranslation();
   const nav = useNavigate();
+    const cardB = usePerfMode().blur(20);
   const followers = useUserFollowers(mode === 'followers' ? urn : undefined);
   const followings = useUserFollowings(mode === 'followings' ? urn : undefined);
   const q = mode === 'followers' ? followers : followings;
@@ -174,12 +256,12 @@ export function UserConnectionsTab({
       <button
         type="button"
         onClick={() => nav(`/user/${encodeURIComponent(user.urn)}`)}
-        className="group relative h-full w-full flex flex-col items-center gap-3 p-6 rounded-3xl transition-all duration-500 cursor-pointer overflow-hidden hover:scale-[1.02]"
+        className="group relative h-full w-full flex flex-col items-center gap-3 p-6 rounded-3xl transition-transform duration-500 cursor-pointer overflow-hidden hover:scale-[1.02]"
         style={{
-          background: 'rgba(255,255,255,0.03)',
+            background: cardB > 0 ? 'rgba(255,255,255,0.03)' : 'rgba(24,24,28,0.85)',
           border: '0.5px solid rgba(255,255,255,0.06)',
-          backdropFilter: 'blur(20px)',
-          WebkitBackdropFilter: 'blur(20px)',
+            backdropFilter: cardB > 0 ? `blur(${cardB}px)` : undefined,
+            WebkitBackdropFilter: cardB > 0 ? `blur(${cardB}px)` : undefined,
         }}
       >
         <div className="w-20 h-20 rounded-full overflow-hidden ring-2 ring-white/10 group-hover:ring-white/30 transition-all duration-500">
@@ -197,7 +279,7 @@ export function UserConnectionsTab({
         </div>
       </button>
     ),
-    [nav, t],
+      [nav, t, cardB],
   );
 
   const emptyText = mode === 'followers' ? t('user.noFollowers') : t('user.noFollowings');

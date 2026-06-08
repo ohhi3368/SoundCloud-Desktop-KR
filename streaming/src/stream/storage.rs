@@ -82,6 +82,23 @@ impl StorageClient {
     }
 
     pub fn upload_in_background(&self, track_urn: String, data: Bytes) {
+        self.upload_in_background_with_quality(track_urn, data, "sq");
+    }
+
+    /// То же что `upload_in_background`, но с явным указанием quality —
+    /// прокидываем в `quality` форм-поле, storage-сервис должен пробросить
+    /// его в NATS event `storage.track_uploaded` чтобы backend обновил
+    /// `tracks.storage_quality` корректно (sq vs hq).
+    pub fn upload_in_background_with_quality(
+        &self,
+        track_urn: String,
+        data: Bytes,
+        quality: &'static str,
+    ) {
+        if !is_canonical_track_urn(&track_urn) {
+            warn!("[storage] refusing upload for non-canonical urn: {track_urn:?}");
+            return;
+        }
         if !self.enabled() || self.is_temporarily_unavailable() {
             return;
         }
@@ -105,18 +122,19 @@ impl StorageClient {
                 }
             };
 
-            match upload_to_storage(&client, &upload_url, &auth_token, &filename, &data).await {
+            match upload_to_storage(&client, &upload_url, &auth_token, &filename, &data, quality)
+                .await
+            {
                 Ok(()) => {
                     consec.store(0, Ordering::Relaxed);
                     until.store(0, Ordering::Relaxed);
                     let _ = pg.update_cdn_track_status(&id, "ok").await;
                     info!(
-                        "[storage] uploaded {} ({:.1} MB)",
+                        "[storage] uploaded {} {} ({:.1} MB)",
                         filename,
+                        quality,
                         data.len() as f64 / 1024.0 / 1024.0
                     );
-                    // storage.track_uploaded NATS event теперь публикует сам storage —
-                    // он узнаёт о реальном завершении S3 PUT после ретраев, а не о HTTP 200.
                 }
                 Err(e) => {
                     let prev = consec.fetch_add(1, Ordering::Relaxed);
@@ -206,6 +224,7 @@ async fn upload_to_storage(
     auth_token: &str,
     filename: &str,
     data: &Bytes,
+    quality: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file_part = reqwest::multipart::Part::bytes(data.to_vec())
         .file_name("audio")
@@ -213,6 +232,7 @@ async fn upload_to_storage(
 
     let form = reqwest::multipart::Form::new()
         .text("filename", filename.to_string())
+        .text("quality", quality.to_string())
         .part("file", file_part);
 
     client
@@ -227,9 +247,41 @@ async fn upload_to_storage(
     Ok(())
 }
 
+/// A well-formed SC track URN: `soundcloud:tracks:<digits>`. The S3 object name
+/// is derived from this via `track_filename` (`:`→`_`); a bare id would yield a
+/// non-canonical `<id>.m4a`, so uploads gate on this.
+pub fn is_canonical_track_urn(track_urn: &str) -> bool {
+    track_urn
+        .strip_prefix("soundcloud:tracks:")
+        .is_some_and(|id| !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()))
+}
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_canonical_track_urn, StorageClient};
+
+    #[test]
+    fn canonical_urn_maps_to_canonical_filename() {
+        assert!(is_canonical_track_urn("soundcloud:tracks:12345"));
+        assert_eq!(
+            StorageClient::track_filename("soundcloud:tracks:12345"),
+            "soundcloud_tracks_12345"
+        );
+    }
+
+    #[test]
+    fn rejects_bare_and_foreign_urns() {
+        assert!(!is_canonical_track_urn("12345"));
+        assert!(!is_canonical_track_urn("soundcloud:users:12345"));
+        assert!(!is_canonical_track_urn("soundcloud:tracks:"));
+        assert!(!is_canonical_track_urn("soundcloud:tracks:abc"));
+        assert!(!is_canonical_track_urn(""));
+    }
 }

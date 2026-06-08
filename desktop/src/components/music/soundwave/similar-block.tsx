@@ -11,14 +11,22 @@ import {
   useClusterWave,
 } from '../cluster';
 import { AmbientLayer } from './ambient';
+import { useInfiniteWave } from './use-infinite-wave';
 
 interface Props {
   trackUrn: string;
 }
 
-const CLUSTER_ORDER: ClusterId[] = ['same_artist', 'same_vibe', 'featured_with', 'fans_also'];
+const CLUSTER_ORDER: ClusterId[] = [
+  'wave',
+  'same_artist',
+  'same_vibe',
+  'featured_with',
+  'fans_also',
+];
 
 const CLUSTER_ICON: Partial<Record<ClusterId, React.ReactNode>> = {
+  wave: <AudioLines size={14} />,
   same_artist: <Disc3 size={14} />,
   same_vibe: <AudioLines size={14} />,
   featured_with: <Compass size={14} />,
@@ -36,13 +44,26 @@ export const SoundWaveSimilarBlock = React.memo(function SoundWaveSimilarBlock({
     url: trackId ? `/recommendations/similar/${encodeURIComponent(trackId)}` : null,
   });
 
-  const clusters = data?.clusters ?? [];
+    const clusters = useMemo(() => data?.clusters ?? [], [data]);
   const allTracks = useMemo(() => data?.allTracks ?? [], [data]);
 
   const orderedClusters = useMemo(() => {
     const byId = new Map(clusters.map((c) => [c.id, c]));
     return CLUSTER_ORDER.map((id) => byId.get(id)).filter((c): c is NonNullable<typeof c> => !!c);
   }, [clusters]);
+
+  const waveCluster = useMemo(
+    () => orderedClusters.find((c) => c.id === 'wave') ?? null,
+    [orderedClusters],
+  );
+
+  useInfiniteWave({
+    enabled: !!trackId,
+    seedKind: 'track',
+    seedId: trackId,
+    initialTracks: waveCluster?.tracks ?? [],
+    initialCursor: null,
+  });
 
   const handlePlay = useCallback(() => {
     if (allTracks.length === 0) return;
@@ -147,7 +168,7 @@ export const SoundWaveSimilarBlock = React.memo(function SoundWaveSimilarBlock({
                   icon={CLUSTER_ICON[c.id]}
                   index={idx}
                   cluster={c}
-                  queue={allTracks}
+                  queue={c.tracks}
                 />
               ) : (
                 <ClusterRow
@@ -158,7 +179,7 @@ export const SoundWaveSimilarBlock = React.memo(function SoundWaveSimilarBlock({
                   icon={CLUSTER_ICON[c.id]}
                   index={idx}
                   tracks={c.tracks}
-                  queue={allTracks}
+                  queue={c.tracks}
                 />
               ),
             )}

@@ -1,6 +1,7 @@
-import { create } from 'zustand';
-import { createJSONStorage, persist } from 'zustand/middleware';
-import { tauriStorage } from '../lib/tauri-storage';
+import {create} from 'zustand';
+import {createJSONStorage, persist} from 'zustand/middleware';
+import type {PerfMode} from '../lib/perf';
+import {tauriStorage} from '../lib/tauri-storage';
 
 export type ThemePreset = 'soundcloud' | 'dark' | 'neon' | 'forest' | 'crimson' | 'custom';
 export type StartupPage = 'home' | 'search' | 'library' | 'settings';
@@ -56,8 +57,10 @@ export interface SettingsState {
   accentColor: string;
   bgPrimary: string;
   themePreset: ThemePreset;
+    perfMode: PerfMode;
   backgroundImage: string;
   backgroundOpacity: number;
+    backgroundDim: number;
   backgroundBlur: number;
   glassBlur: number;
   audioCacheLimitMB: number;
@@ -81,11 +84,14 @@ export interface SettingsState {
   soundwaveHideLiked: boolean;
   lyricsVisualizer: boolean;
   artistWaveCollapsed: boolean;
+    wallhavenApiKey: string;
   setAccentColor: (color: string) => void;
   setBgPrimary: (bg: string) => void;
   setThemePreset: (id: ThemePreset) => void;
+    setPerfMode: (mode: PerfMode) => void;
   setBackgroundImage: (url: string) => void;
   setBackgroundOpacity: (opacity: number) => void;
+    setBackgroundDim: (dim: number) => void;
   setBackgroundBlur: (blur: number) => void;
   setGlassBlur: (blur: number) => void;
   setAudioCacheLimitMB: (limit: number) => void;
@@ -111,6 +117,7 @@ export interface SettingsState {
   setSoundwaveHideLiked: (v: boolean) => void;
   setLyricsVisualizer: (v: boolean) => void;
   setArtistWaveCollapsed: (v: boolean) => void;
+    setWallhavenApiKey: (key: string) => void;
   resetTheme: () => void;
 }
 
@@ -120,8 +127,10 @@ const DEFAULTS = {
   accentColor: '#ff5500',
   bgPrimary: '#08080a',
   themePreset: 'soundcloud' as ThemePreset,
+    perfMode: 'beauty' as PerfMode,
   backgroundImage: '',
   backgroundOpacity: 0.15,
+    backgroundDim: 0,
   backgroundBlur: 0,
   glassBlur: 40,
   audioCacheLimitMB: 1024,
@@ -145,6 +154,7 @@ const DEFAULTS = {
   soundwaveHideLiked: false,
   lyricsVisualizer: false,
   artistWaveCollapsed: false,
+    wallhavenApiKey: '',
 };
 
 export const useSettingsStore = create<SettingsState>()(
@@ -161,8 +171,10 @@ export const useSettingsStore = create<SettingsState>()(
           set({ themePreset: id, accentColor: preset.accent, bgPrimary: preset.bg });
         }
       },
+        setPerfMode: (perfMode) => set({perfMode}),
       setBackgroundImage: (backgroundImage) => set({ backgroundImage }),
       setBackgroundOpacity: (backgroundOpacity) => set({ backgroundOpacity }),
+        setBackgroundDim: (backgroundDim) => set({backgroundDim}),
       setBackgroundBlur: (backgroundBlur) => set({ backgroundBlur }),
       setGlassBlur: (glassBlur) => set({ glassBlur }),
       setAudioCacheLimitMB: (audioCacheLimitMB) => set({ audioCacheLimitMB }),
@@ -202,6 +214,7 @@ export const useSettingsStore = create<SettingsState>()(
       setSoundwaveHideLiked: (soundwaveHideLiked) => set({ soundwaveHideLiked }),
       setLyricsVisualizer: (lyricsVisualizer) => set({ lyricsVisualizer }),
       setArtistWaveCollapsed: (artistWaveCollapsed) => set({ artistWaveCollapsed }),
+        setWallhavenApiKey: (wallhavenApiKey) => set({wallhavenApiKey}),
       resetTheme: () =>
         set({
           accentColor: DEFAULTS.accentColor,
@@ -209,6 +222,7 @@ export const useSettingsStore = create<SettingsState>()(
           themePreset: DEFAULTS.themePreset,
           backgroundImage: DEFAULTS.backgroundImage,
           backgroundOpacity: DEFAULTS.backgroundOpacity,
+            backgroundDim: DEFAULTS.backgroundDim,
           backgroundBlur: DEFAULTS.backgroundBlur,
           glassBlur: DEFAULTS.glassBlur,
         }),
@@ -216,7 +230,7 @@ export const useSettingsStore = create<SettingsState>()(
     {
       name: 'sc-settings',
       storage: createJSONStorage(() => tauriStorage),
-      version: 15,
+        version: 18,
       migrate: (persistedState) => {
         const prev = (persistedState ?? {}) as Partial<SettingsState> & {
           soundwaveDiversity?: number;
@@ -237,8 +251,10 @@ export const useSettingsStore = create<SettingsState>()(
         accentColor: s.accentColor,
         bgPrimary: s.bgPrimary,
         themePreset: s.themePreset,
+          perfMode: s.perfMode,
         backgroundImage: s.backgroundImage,
         backgroundOpacity: s.backgroundOpacity,
+          backgroundDim: s.backgroundDim,
         backgroundBlur: s.backgroundBlur,
         glassBlur: s.glassBlur,
         audioCacheLimitMB: s.audioCacheLimitMB,
@@ -261,6 +277,7 @@ export const useSettingsStore = create<SettingsState>()(
         soundwaveHideLiked: s.soundwaveHideLiked,
         lyricsVisualizer: s.lyricsVisualizer,
         artistWaveCollapsed: s.artistWaveCollapsed,
+          wallhavenApiKey: s.wallhavenApiKey,
       }),
     },
   ),

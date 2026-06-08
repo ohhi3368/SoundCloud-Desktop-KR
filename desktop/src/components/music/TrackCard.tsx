@@ -1,29 +1,32 @@
 import React from 'react';
-import { useTranslation } from 'react-i18next';
-import { useNavigate } from 'react-router-dom';
-import { preloadTrack } from '../../lib/audio';
-import { art, dur, fc } from '../../lib/formatters';
-import { ListMusic, ListPlus, pauseBlack20, playBlack20, playIcon32 } from '../../lib/icons';
-import { recordClusterFeedback, setUrnCluster, useClusterFeedback } from '../../lib/recsFeedback';
-import { useArtistDisplay, useDisplayTitle } from '../../lib/track-display';
-import { useAutoHide } from '../../lib/useAutoHide';
-import { useTrackPlay } from '../../lib/useTrackPlay';
-import type { Track } from '../../stores/player';
-import { usePlayerStore } from '../../stores/player';
-import { AddToPlaylistDialog } from './AddToPlaylistDialog';
-import { LikeButton } from './LikeButton';
-import { UploadKindDot } from './UploadKindDot';
+import {useTranslation} from 'react-i18next';
+import {useNavigate} from 'react-router-dom';
+import {preloadTrack} from '../../lib/audio';
+import {art, dur, fc} from '../../lib/formatters';
+import {ListMusic, ListPlus, pauseBlack20, playBlack20, playIcon32} from '../../lib/icons';
+import {recordClusterFeedback, setUrnCluster, useClusterFeedback} from '../../lib/recsFeedback';
+import {useArtistDisplay, useDisplayTitle} from '../../lib/track-display';
+import {useAutoHide} from '../../lib/useAutoHide';
+import {useTrackPlay} from '../../lib/useTrackPlay';
+import type {Track} from '../../stores/player';
+import {usePlayerStore} from '../../stores/player';
+import {AddToPlaylistDialog} from './AddToPlaylistDialog';
+import {LikeButton} from './LikeButton';
+import {TrackStatusBadges} from './TrackStatusBadges';
+import {UploadKindDot} from './UploadKindDot';
 
 interface TrackCardProps {
   track: Track;
   queue?: Track[];
+    /** Fires after a new track starts — e.g. arm «лайки до конца». Keep stable. */
+    onPlay?: () => void;
 }
 
 export const TrackCard = React.memo(
-  function TrackCard({ track, queue }: TrackCardProps) {
+    function TrackCard({track, queue, onPlay}: TrackCardProps) {
     const { t } = useTranslation();
     const navigate = useNavigate();
-    const { isThisPlaying, togglePlay: togglePlayRaw } = useTrackPlay(track, queue);
+        const {isThisPlaying, togglePlay: togglePlayRaw} = useTrackPlay(track, queue, onPlay);
     const showPlayingOverlay = useAutoHide(isThisPlaying);
     const clusterId = useClusterFeedback();
     const togglePlay = React.useCallback(() => {
@@ -54,11 +57,7 @@ export const TrackCard = React.memo(
       <div
         className="group relative select-none"
         onMouseEnter={() => preloadTrack(track.urn)}
-        style={{
-          contentVisibility: 'auto',
-          contain: 'layout paint style',
-          containIntrinsicSize: '180px 260px',
-        }}
+        style={{contain: 'layout paint style'}}
       >
         {/* Artwork */}
         <div
@@ -101,6 +100,11 @@ export const TrackCard = React.memo(
             <div className="text-[10px] font-medium bg-black/50 backdrop-blur-md text-white/80 px-2 py-0.5 rounded-full">
               {dur(track.duration)}
             </div>
+          </div>
+
+          {/* Cache / analysis badges — bottom left */}
+          <div className="absolute bottom-2 left-2 flex">
+            <TrackStatusBadges meta={track._scd_meta} variant="overlay" />
           </div>
 
           {/* Like button — top left */}
@@ -168,5 +172,8 @@ export const TrackCard = React.memo(
     prev.track.user_favorite === next.track.user_favorite &&
     prev.track.enrichment?.primary_artist?.name === next.track.enrichment?.primary_artist?.name &&
     prev.track.enrichment?.upload_kind === next.track.enrichment?.upload_kind &&
-    prev.track.enrichment?.availability === next.track.enrichment?.availability,
+    prev.track.enrichment?.availability === next.track.enrichment?.availability &&
+    prev.track._scd_meta?.storage_state === next.track._scd_meta?.storage_state &&
+    prev.track._scd_meta?.storage_quality === next.track._scd_meta?.storage_quality &&
+    prev.track._scd_meta?.index_state === next.track._scd_meta?.index_state,
 );

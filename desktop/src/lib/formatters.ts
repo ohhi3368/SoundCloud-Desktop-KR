@@ -1,4 +1,4 @@
-import { proxiedAssetUrl } from './asset-url';
+import {proxiedAssetUrl} from './asset-url';
 
 /** SoundCloud artwork URL: replace -large with desired size */
 export function art(url: string | null | undefined, size = 't500x500'): string | null {
@@ -11,6 +11,15 @@ export function fc(n?: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
   if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
   return String(n);
+}
+
+/** Format a byte count: 0 → "0 B", 1536 → "1.5 KB", 1.5e9 → "1.40 GB" */
+export function formatBytes(bytes: number): string {
+    if (bytes <= 0) return '0 B';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    if (bytes < 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+    return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
 }
 
 /** Format duration from milliseconds: 185000 → "3:05" */
@@ -37,9 +46,23 @@ export function formatTime(seconds: number): string {
   return `${m}:${s.toString().padStart(2, '0')}`;
 }
 
-/** Relative time: "2026-01-01T00:00:00Z" → "2mo" */
-export function ago(dateStr: string): string {
+function parseScDate(dateStr: string | null | undefined): Date | null {
+  if (!dateStr) return null;
   const d = new Date(dateStr.replace(/\//g, '-').replace(' +0000', 'Z'));
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** SoundCloud timestamp → epoch ms (handles "2024/05/28 12:00:00 +0000" and ISO).
+ *  Invalid/empty → 0, so it sorts last. Use this for chronological sorts; plain
+ *  Date.parse chokes on SC's slash+offset format and returns NaN. */
+export function scDateMs(dateStr: string | null | undefined): number {
+    return parseScDate(dateStr)?.getTime() ?? 0;
+}
+
+/** Relative time: "2026-01-01T00:00:00Z" → "2mo". Пустой/невалидный → ''. */
+export function ago(dateStr: string | null | undefined): string {
+  const d = parseScDate(dateStr);
+  if (!d) return '';
   const s = Math.floor((Date.now() - d.getTime()) / 1000);
   if (s < 60) return 'now';
   const m = Math.floor(s / 60);
@@ -55,9 +78,10 @@ export function ago(dateStr: string): string {
   return `${Math.floor(dd / 365)}y`;
 }
 
-/** Formatted date: "2026-01-01" → "Jan 1, 2026" */
-export function dateFormatted(dateStr: string): string {
-  const d = new Date(dateStr.replace(/\//g, '-').replace(' +0000', 'Z'));
+/** Formatted date: "2026-01-01" → "Jan 1, 2026". Пустой/невалидный → ''. */
+export function dateFormatted(dateStr: string | null | undefined): string {
+  const d = parseScDate(dateStr);
+  if (!d) return '';
   return d.toLocaleDateString(undefined, {
     year: 'numeric',
     month: 'short',

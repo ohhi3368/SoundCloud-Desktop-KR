@@ -1,6 +1,6 @@
 use axum::extract::{Path, Query, State};
 use axum::response::{IntoResponse, Redirect, Response};
-use axum::routing::get;
+use axum::routing::{get, put};
 use axum::{Json, Router};
 use serde::Deserialize;
 use serde_json::Value;
@@ -27,9 +27,15 @@ pub fn router() -> Router<AppState> {
             "/tracks/{track_urn}/comments",
             get(get_comments).post(create_comment),
         )
+        .route("/tracks/{track_urn}/sharing", put(set_track_sharing))
         .route("/tracks/{track_urn}/favoriters", get(get_favoriters))
         .route("/tracks/{track_urn}/reposters", get(get_reposters))
         .route("/tracks/{track_urn}/related", get(get_related))
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct SharingBody {
+    sharing: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,7 +97,7 @@ async fn search(
     }
     let mut result = st
         .tracks
-        .search(&ctx.access_token, &ctx.sc_user_id, page, limit, extra)
+        .search(ctx.session_id, &ctx.sc_user_id, page, limit, extra)
         .await?;
     enrich_dto::apply_to_tracks(&st.pg, &mut result.collection).await?;
     Ok(Json(result))
@@ -109,7 +115,7 @@ async fn get_by_id(
     }
     let mut track = st
         .tracks
-        .get_by_id(&ctx.access_token, &ctx.sc_user_id, &track_urn, &params)
+        .get_by_id(ctx.session_id, &ctx.sc_user_id, &track_urn, &params)
         .await?;
     enrich_dto::apply_to_track(&st.pg, &mut track).await?;
     Ok(Json(track))
@@ -122,9 +128,7 @@ async fn update_track(
     Json(body): Json<Value>,
 ) -> AppResult<Json<Value>> {
     Ok(Json(
-        st.tracks
-            .update(&ctx.access_token, &track_urn, &body)
-            .await?,
+        st.tracks.update(ctx.session_id, &track_urn, &body).await?,
     ))
 }
 
@@ -133,7 +137,20 @@ async fn delete_track(
     ctx: SessionCtx,
     Path(track_urn): Path<String>,
 ) -> AppResult<Json<Value>> {
-    Ok(Json(st.tracks.delete(&ctx.access_token, &track_urn).await?))
+    Ok(Json(st.tracks.delete(ctx.session_id, &track_urn).await?))
+}
+
+async fn set_track_sharing(
+    State(st): State<AppState>,
+    ctx: SessionCtx,
+    Path(track_urn): Path<String>,
+    Json(body): Json<SharingBody>,
+) -> AppResult<Json<Value>> {
+    Ok(Json(
+        st.tracks
+            .set_sharing(&ctx.sc_user_id, &track_urn, &body.sharing)
+            .await?,
+    ))
 }
 
 async fn get_streams(
@@ -149,15 +166,17 @@ async fn get_streams(
     let url = request_url(&format!("/tracks/{track_urn}/streams"), "", &params);
     cached_or_fetch(
         &st,
-        "GET",
-        &url,
-        CacheScope::Shared,
-        None,
-        3600,
-        None,
+        crate::common::cache_helper::CacheOpts {
+            method: "GET",
+            url: &url,
+            scope: CacheScope::Shared,
+            session_id: None,
+            ttl_sec: 3600,
+            cache_key: None,
+        },
         || async {
             st.tracks
-                .get_streams(&ctx.access_token, &track_urn, &params)
+                .get_streams(ctx.session_id, &track_urn, &params)
                 .await
         },
     )
@@ -195,7 +214,7 @@ async fn get_comments(
     let (page, limit) = p.resolved();
     Ok(Json(
         st.tracks
-            .get_comments(&ctx.access_token, &track_urn, page, limit)
+            .get_comments(ctx.session_id, &track_urn, page, limit)
             .await?,
     ))
 }
@@ -230,7 +249,7 @@ async fn get_favoriters(
     let (page, limit) = p.resolved();
     Ok(Json(
         st.tracks
-            .get_favoriters(&ctx.access_token, &track_urn, page, limit)
+            .get_favoriters(ctx.session_id, &track_urn, page, limit)
             .await?,
     ))
 }
@@ -244,7 +263,7 @@ async fn get_reposters(
     let (page, limit) = p.resolved();
     Ok(Json(
         st.tracks
-            .get_reposters(&ctx.access_token, &track_urn, page, limit)
+            .get_reposters(ctx.session_id, &track_urn, page, limit)
             .await?,
     ))
 }
@@ -263,7 +282,7 @@ async fn get_related(
     let mut result = st
         .tracks
         .get_related(
-            &ctx.access_token,
+            ctx.session_id,
             &ctx.sc_user_id,
             &track_urn,
             page,

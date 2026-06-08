@@ -41,7 +41,13 @@ export interface TrackEnrichment {
   release_year?: number;
   release_date?: string;
   release_source?: string;
-  isrc?: string;
+}
+
+export interface TrackScdMeta {
+    storage_state: 'pending' | 'ok' | 'failed' | 'missing' | 'too_long';
+  storage_quality?: 'sq' | 'hq';
+    index_state: 'pending' | 'indexed' | 'failed' | 'too_long';
+  enrich_state: 'pending' | 'done' | 'failed';
 }
 
 export interface Track {
@@ -49,13 +55,19 @@ export interface Track {
   urn: string;
   title: string;
   duration: number;
+  full_duration?: number;
   artwork_url: string | null;
   permalink_url?: string;
   waveform_url?: string;
   genre?: string;
   tag_list?: string;
   description?: string;
+  language?: string;
+  release_year?: number;
+  release_date?: string;
   created_at?: string;
+  last_modified?: string;
+  sharing?: 'public' | 'private';
   comment_count?: number;
   playback_count?: number;
   likes_count?: number;
@@ -63,19 +75,65 @@ export interface Track {
   reposts_count?: number;
   user_favorite?: boolean;
   access?: 'playable' | 'preview' | 'blocked';
+  publisher_metadata?: {
+    isrc?: string;
+  };
   user: {
     id: number;
     urn: string;
     username: string;
     avatar_url: string;
-    permalink_url: string;
+    permalink_url?: string;
+    verified?: boolean;
+    country_code?: string;
+    city?: string;
+    description?: string;
+    followers_count?: number;
+    followings_count?: number;
+    track_count?: number;
   };
   enrichment?: TrackEnrichment;
+  _scd_meta?: TrackScdMeta;
 }
 
 type RepeatMode = 'off' | 'one' | 'all';
 export type PlaybackQuality = 'hq' | 'sq';
-export type PlaybackSource = 'storage' | 'api';
+
+/**
+ * A-B loop ("best part" repeat). Bounds are in **source seconds**.
+ * `b === null` means point A is set and we're waiting for B — the loop is not
+ * active yet. Both set → playback loops the `[a, b]` segment.
+ */
+export interface AbLoop {
+    a: number;
+    b: number | null;
+}
+
+/** Smallest meaningful loop width / handle gap, in seconds. */
+export const AB_MIN_GAP = 0.2;
+
+/**
+ * Module-level slot для обработчика "очередь кончилась". Не часть PlayerState,
+ * чтобы persist его не сериализовал. Регистрирует lib/queue-autopilot.ts.
+ */
+let endOfQueueFallback: ((lastTrack: Track) => void) | null = null;
+export function setEndOfQueueFallback(fn: (lastTrack: Track) => void): void {
+  endOfQueueFallback = fn;
+}
+
+/**
+ * Слот «началось новое воспроизведение из UI» — сбрасывает контекстный источник
+ * дозагрузки очереди (см. lib/queue-continuation.ts), чтобы прошлый контекст
+ * (напр. лайки) не дотягивался в чужую очередь. Регистрирует queue-autopilot.ts.
+ */
+let onPlaybackContextReset: (() => void) | null = null;
+
+export function setPlaybackContextResetHandler(fn: () => void): void {
+    onPlaybackContextReset = fn;
+}
+
+// Mirrors the Rust DownloadSource enum (serde rename_all = "lowercase").
+export type PlaybackSource = 'storage' | 'anon' | 'direct' | 'api';
 
 export const PLAYBACK_RATE_MIN = 0.5;
 export const PLAYBACK_RATE_MAX = 2.0;
@@ -131,6 +189,8 @@ interface PlayerState {
   volumeBeforeMute: number;
   shuffle: boolean;
   repeat: RepeatMode;
+    /** A-B segment loop for the current track, or null when disabled. */
+    abLoop: AbLoop | null;
   /** Download progress 0-1 when loading from API, null when not downloading */
   downloadProgress: number | null;
   playbackQuality: PlaybackQuality | null;
@@ -160,6 +220,11 @@ interface PlayerState {
   clearQueue: () => void;
   toggleShuffle: () => void;
   toggleRepeat: () => void;
+    /** Tap-to-set cycle at the given source-seconds position: set A → set B → clear. */
+    cycleAbPoint: (pos: number) => void;
+    /** Drag a single loop bound (used by the markers on the progress bar). */
+    nudgeAbBound: (which: 'a' | 'b', value: number) => void;
+    clearAbLoop: () => void;
   setCurrentTrackAccess: (access: Track['access']) => void;
   replaceTrackMetadata: (track: Track) => void;
   setPlaybackTransport: (quality: PlaybackQuality | null, source: PlaybackSource | null) => void;
@@ -177,6 +242,7 @@ export const usePlayerStore = create<PlayerState>()(
       volumeBeforeMute: 50,
       shuffle: false,
       repeat: 'off',
+        abLoop: null,
       downloadProgress: null,
       playbackQuality: null,
       playbackSource: null,
@@ -185,6 +251,7 @@ export const usePlayerStore = create<PlayerState>()(
       pitchControlMode: 'auto',
 
       play: (track, queue) => {
+          onPlaybackContextReset?.();
         if (queue) {
           const { shuffle } = get();
           const idx = queue.findIndex((t) => t.urn === track.urn);
@@ -248,6 +315,14 @@ export const usePlayerStore = create<PlayerState>()(
         if (nextIdx >= queue.length) {
           if (repeat === 'all') nextIdx = 0;
           else {
+            // Конец очереди + repeat=off → отдаём управление autopilot'у
+            // (см. lib/queue-autopilot.ts). Если он зарегистрирован — он сам
+            // дозагрузит треки и пнёт next() ещё раз. Если нет — просто пауза.
+            const last = queue[queueIndex];
+            if (endOfQueueFallback && last) {
+              endOfQueueFallback(last);
+              return;
+            }
             set({ isPlaying: false });
             return;
           }
@@ -404,6 +479,38 @@ export const usePlayerStore = create<PlayerState>()(
         set((s) => ({
           repeat: s.repeat === 'off' ? 'all' : s.repeat === 'all' ? 'one' : 'off',
         })),
+
+        cycleAbPoint: (pos) =>
+            set((s) => {
+                const at = Math.max(0, pos);
+                const ab = s.abLoop;
+                // No loop yet → drop point A.
+                if (!ab) return {abLoop: {a: at, b: null}};
+                // A set, awaiting B → place the second point, ordering the pair.
+                if (ab.b == null) {
+                    if (at > ab.a + AB_MIN_GAP) return {abLoop: {a: ab.a, b: at}};
+                    if (at < ab.a - AB_MIN_GAP) return {abLoop: {a: at, b: ab.a}};
+                    return {abLoop: null}; // too close to A → cancel
+                }
+                // Active loop → clear.
+                return {abLoop: null};
+            }),
+
+        nudgeAbBound: (which, value) =>
+            set((s) => {
+                if (!s.abLoop) return {};
+                const {a, b} = s.abLoop;
+                if (which === 'a') {
+                    const na = Math.max(0, value);
+                    if (b != null && na > b - AB_MIN_GAP) return {};
+                    return {abLoop: {a: na, b}};
+                }
+                const nb = Math.max(0, value);
+                if (nb < a + AB_MIN_GAP) return {};
+                return {abLoop: {a, b: nb}};
+            }),
+
+        clearAbLoop: () => set((s) => (s.abLoop ? {abLoop: null} : {})),
 
       setCurrentTrackAccess: (access) =>
         set((s) => (s.currentTrack ? { currentTrack: { ...s.currentTrack, access } } : {})),

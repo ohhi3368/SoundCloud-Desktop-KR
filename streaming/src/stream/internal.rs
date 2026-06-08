@@ -1,12 +1,10 @@
 //! Internal pipeline endpoint — только для backend'а.
 //!
 //! `POST /internal/transcode-upload/:track_urn` — Bearer=INTERNAL_TOKEN.
-//!
-//! 1. Проверяет, что файл уже есть в storage (HEAD) — возвращает стабильный redirect-URL.
-//! 2. Иначе: качает трек (cookies HQ → oauth HQ → oauth SQ → anon), НЕ зависит от premium-only.
-//! 3. Заливает в storage через multipart /upload (storage транскодит в один AAC m4a).
-//! 4. Возвращает `{ url }` вида `{storage}/redirect/{file}.m4a`. В S3-режиме storage
-//!    пересчитывает presigned, в Gdrive — public link, в local — стримит сам.
+//! Возвращает `202 Accepted` сразу после auth+HEAD-проверки. Если файл уже
+//! в storage — сразу `200 {cached:true}`. Иначе download + storage-upload
+//! идут фоновой tokio-таской; завершение приходит к backend'у NATS-евентом
+//! `storage.track_uploaded`, который шлёт сам storage по результату S3 PUT.
 
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
@@ -14,15 +12,24 @@ use axum::Json;
 use bytes::Bytes;
 use reqwest::Client;
 use serde::Serialize;
+use std::sync::Arc;
+use subtle::ConstantTimeEq;
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 
-use crate::stream::storage::StorageClient;
+use crate::stream::storage::{is_canonical_track_urn, StorageClient};
 use crate::AppState;
+
+/// Глобальный лимит одновременно качающихся треков. Backend дедупит триггеры
+/// 16-широким семафором, но streaming могут долбить и ручные ретраи /
+/// несколько backend'ов — оставляем свой потолок.
+static FETCH_SEM: once_cell::sync::Lazy<Arc<Semaphore>> =
+    once_cell::sync::Lazy::new(|| Arc::new(Semaphore::new(8)));
 
 #[derive(Serialize)]
 pub struct TranscodeUploadResponse {
+    pub status: &'static str,
     pub url: String,
-    pub size_bytes: usize,
     pub cached: bool,
 }
 
@@ -32,6 +39,13 @@ pub async fn transcode_upload(
     headers: HeaderMap,
 ) -> Result<Json<TranscodeUploadResponse>, (StatusCode, String)> {
     check_auth(&headers, &state.config.internal_token)?;
+
+    if !is_canonical_track_urn(&track_urn) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "track_urn must be a canonical soundcloud:tracks:<id> URN".into(),
+        ));
+    }
 
     if state.config.storage_url.is_empty() || state.config.storage_token.is_empty() {
         return Err((
@@ -46,67 +60,56 @@ pub async fn transcode_upload(
     let head_url = format!("{storage_base}/{key}");
     let redirect_url = format!("{storage_base}/redirect/{key}");
 
-    // 1. Уже лежит в storage → сразу отдаём стабильный redirect-URL.
     if head_ok(&state.http_client, &head_url).await {
-        info!("[internal/transcode-upload] {track_urn} already in storage");
         return Ok(Json(TranscodeUploadResponse {
+            status: "cached",
             url: redirect_url,
-            size_bytes: 0,
             cached: true,
         }));
     }
 
-    // 2. Качаем: HQ cookies → HQ oauth → SQ oauth → SQ cookies → anon.
-    //    Если упали, но файл параллельно появился в storage — не считаем ошибкой.
-    let data = match fetch_track(&state, &track_urn).await {
-        Some(d) => d,
-        None => {
-            if head_ok(&state.http_client, &head_url).await {
-                info!(
-                    "[internal/transcode-upload] {track_urn} appeared in storage after fetch fail"
-                );
-                return Ok(Json(TranscodeUploadResponse {
-                    url: redirect_url,
-                    size_bytes: 0,
-                    cached: true,
-                }));
+    let task_state = state.clone();
+    let task_urn = track_urn.clone();
+    let task_head = head_url.clone();
+    let task_filename = filename.clone();
+    tokio::spawn(async move {
+        let _permit = match FETCH_SEM.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        if head_ok(&task_state.http_client, &task_head).await {
+            return;
+        }
+        let (data, quality) = match fetch_track(&task_state, &task_urn).await {
+            Some(d) => d,
+            None => {
+                warn!("[internal/transcode-upload] {task_urn} no stream available");
+                return;
             }
-            return Err((StatusCode::BAD_GATEWAY, "no stream available".into()));
+        };
+        let upload_base = task_state.config.storage_upload_url.trim_end_matches('/');
+        if let Err(e) = upload_to_storage(
+            &task_state.http_client,
+            upload_base,
+            &task_state.config.storage_token,
+            &task_filename,
+            &data,
+            quality,
+        )
+        .await
+        {
+            warn!("[internal/transcode-upload] upload {task_urn} failed: {e}");
+            return;
         }
-    };
-
-    // 3. Заливаем в storage (multipart). Storage транскодит в один AAC m4a.
-    //    Если upload вернул ошибку, но файл уже лежит (гонка/повторный запрос) — ок.
-    let upload_base = state.config.storage_upload_url.trim_end_matches('/');
-    if let Err(e) = upload_to_storage(
-        &state.http_client,
-        upload_base,
-        &state.config.storage_token,
-        &filename,
-        &data,
-    )
-    .await
-    {
-        if head_ok(&state.http_client, &head_url).await {
-            info!("[internal/transcode-upload] {track_urn} upload failed ({e}) but file present");
-            return Ok(Json(TranscodeUploadResponse {
-                url: redirect_url,
-                size_bytes: 0,
-                cached: true,
-            }));
-        }
-        warn!("[internal/transcode-upload] upload {track_urn} failed: {e}");
-        return Err((StatusCode::BAD_GATEWAY, format!("storage upload: {e}")));
-    }
-
-    info!(
-        "[internal/transcode-upload] {track_urn} uploaded {:.1}MB",
-        data.len() as f64 / 1024.0 / 1024.0
-    );
+        info!(
+            "[internal/transcode-upload] {task_urn} uploaded {:.1}MB",
+            data.len() as f64 / 1024.0 / 1024.0
+        );
+    });
 
     Ok(Json(TranscodeUploadResponse {
+        status: "accepted",
         url: redirect_url,
-        size_bytes: data.len(),
         cached: false,
     }))
 }
@@ -123,7 +126,7 @@ fn check_auth(headers: &HeaderMap, expected: &str) -> Result<(), (StatusCode, St
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "missing token".into()))?;
-    if token != expected {
+    if token.as_bytes().ct_eq(expected.as_bytes()).unwrap_u8() != 1 {
         return Err((StatusCode::FORBIDDEN, "invalid token".into()));
     }
     Ok(())
@@ -141,25 +144,27 @@ async fn head_ok(client: &Client, url: &str) -> bool {
     }
 }
 
-/// Cascade: cookies(HQ) → oauth(HQ) → oauth(SQ) → cookies(SQ) → anon.
+/// Cascade: cookies(HQ) → cookies(SQ) → anon. Returns the bytes plus the quality
+/// (`hq`/`sq`) actually obtained, so storage records `storage_quality` correctly
+/// instead of defaulting everything to `sq`.
 /// OAuth здесь не используется (нет сессии) — только анонимные/cookies пути.
-async fn fetch_track(state: &AppState, track_urn: &str) -> Option<Bytes> {
+async fn fetch_track(state: &AppState, track_urn: &str) -> Option<(Bytes, &'static str)> {
     let tag = "[internal/fetch]";
 
     if let Some(cookies) = state.cookies.as_ref() {
         if let Ok(Some(result)) = cookies.get_stream(track_urn, true).await {
             info!("{tag} {track_urn} → cookies/hq");
-            return Some(result.data);
+            return Some((result.data, "hq"));
         }
         if let Ok(Some(result)) = cookies.get_stream(track_urn, false).await {
             info!("{tag} {track_urn} → cookies/sq");
-            return Some(result.data);
+            return Some((result.data, "sq"));
         }
     }
 
     if let Ok(Some(result)) = state.anon.get_stream(track_urn).await {
         info!("{tag} {track_urn} → anon");
-        return Some(result.data);
+        return Some((result.data, "sq"));
     }
 
     warn!("{tag} {track_urn} → no stream available");
@@ -172,6 +177,7 @@ async fn upload_to_storage(
     auth_token: &str,
     filename: &str,
     data: &Bytes,
+    quality: &'static str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let file_part = reqwest::multipart::Part::bytes(data.to_vec())
         .file_name("audio")
@@ -179,6 +185,7 @@ async fn upload_to_storage(
 
     let form = reqwest::multipart::Form::new()
         .text("filename", filename.to_string())
+        .text("quality", quality)
         .part("file", file_part);
 
     client

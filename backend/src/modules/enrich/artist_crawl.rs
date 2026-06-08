@@ -1,20 +1,18 @@
 use std::sync::Arc;
-use std::time::Duration;
 
+use futures::future::join_all;
 use serde_json::Value;
 use sqlx::PgPool;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 use uuid::Uuid;
 
-use crate::config::EnrichCrawlCfg;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::modules::auth::{try_with_chain, TokenKind, TokenProvider};
 use crate::modules::enrich::mb::{MbArtistUrl, MbClient, MbRecordingBrief};
 use crate::modules::enrich::normalize::{normalize_name, normalize_title};
 use crate::modules::enrich::sc_accounts::{
     self, extract_sc_user_id_from_resolve, is_soundcloud_url, AccountRole,
 };
-use crate::modules::enrich::token_pool::TokenPool;
 use crate::modules::lyrics::genius::{
     GeniusAlbumTrack, GeniusArtistDetails, GeniusService, GeniusSongMeta,
 };
@@ -23,16 +21,14 @@ use crate::sc::ScClient;
 
 const MB_PAGE_SIZE: u32 = 100;
 const GENIUS_PAGE_SIZE: u32 = 50;
-const SC_TOKEN_EXTRA: usize = 2;
 
 pub struct ArtistCrawlService {
     pg: PgPool,
     mb: Arc<MbClient>,
     genius: Arc<GeniusService>,
     sc: ScClient,
-    tokens: Arc<TokenPool>,
+    tokens: Arc<TokenProvider>,
     resolve: Arc<ResolveService>,
-    cfg: EnrichCrawlCfg,
 }
 
 type ArtistRow = (
@@ -56,9 +52,8 @@ impl ArtistCrawlService {
         mb: Arc<MbClient>,
         genius: Arc<GeniusService>,
         sc: ScClient,
-        tokens: Arc<TokenPool>,
+        tokens: Arc<TokenProvider>,
         resolve: Arc<ResolveService>,
-        cfg: EnrichCrawlCfg,
     ) -> Arc<Self> {
         Arc::new(Self {
             pg,
@@ -67,146 +62,7 @@ impl ArtistCrawlService {
             sc,
             tokens,
             resolve,
-            cfg,
         })
-    }
-
-    pub fn spawn(self: &Arc<Self>, shutdown: CancellationToken) {
-        if !self.cfg.enabled {
-            info!("artist crawl disabled by config");
-            return;
-        }
-        self.spawn_fresh_pickup(shutdown.clone());
-        let svc = self.clone();
-        tokio::spawn(async move {
-            let interval = Duration::from_secs(svc.cfg.interval_sec.max(60));
-            let mut ticker = tokio::time::interval(interval);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
-                        if let Err(e) = svc.run_tick().await {
-                            warn!(error = %e, "artist crawl tick failed");
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    async fn run_tick(&self) -> AppResult<()> {
-        let stale_after = chrono::Duration::hours(self.cfg.stale_after_hours.max(1) as i64);
-        let stale_cutoff = chrono::Utc::now() - stale_after;
-        let max_attempts = self.cfg.max_attempts as i16;
-        let batch = self.cfg.batch_size.max(1);
-
-        let rows: Vec<ArtistRow> = sqlx::query_as(
-            "WITH activity AS (
-                 SELECT ta.artist_id, COUNT(*)::int8 AS event_count
-                 FROM user_events ue
-                 JOIN indexed_tracks it ON it.sc_track_id = ue.sc_track_id
-                 JOIN track_artists ta ON ta.indexed_track_id = it.id
-                 WHERE ue.created_at > now() - interval '30 days'
-                 GROUP BY ta.artist_id
-             ),
-             picked AS (
-                 SELECT a.id
-                 FROM artists a
-                 LEFT JOIN activity ac ON ac.artist_id = a.id
-                 WHERE a.merged_into IS NULL
-                   AND a.confidence >= 0.5
-                   AND a.crawl_attempts < $1
-                   AND (a.last_crawled_at IS NULL OR a.last_crawled_at < $2)
-                 ORDER BY ac.event_count DESC NULLS LAST,
-                          a.last_crawled_at NULLS FIRST,
-                          a.confidence DESC
-                 LIMIT $3
-                 FOR UPDATE SKIP LOCKED
-             )
-             UPDATE artists a
-             SET last_crawled_at = now(),
-                 crawl_attempts = a.crawl_attempts + 1
-             FROM picked
-             WHERE a.id = picked.id
-             RETURNING a.id, a.mb_artist_id, a.genius_artist_id, a.sc_user_id, a.mb_crawl_offset, a.genius_crawl_offset",
-        )
-        .bind(max_attempts)
-        .bind(stale_cutoff)
-        .bind(batch)
-        .fetch_all(&self.pg)
-        .await?;
-
-        if rows.is_empty() {
-            return Ok(());
-        }
-        info!(count = rows.len(), "artist crawl: processing batch");
-
-        for (artist_id, mb_id, genius_id, sc_user_id, mb_off, genius_off) in rows {
-            if let Err(e) = self
-                .crawl_one(
-                    artist_id,
-                    mb_id.as_deref(),
-                    genius_id.as_deref(),
-                    sc_user_id.as_deref(),
-                    mb_off as u32,
-                    genius_off as u32,
-                )
-                .await
-            {
-                warn!(artist = %artist_id, error = %e, "artist crawl failed");
-            }
-        }
-        Ok(())
-    }
-
-    fn spawn_fresh_pickup(self: &Arc<Self>, shutdown: CancellationToken) {
-        let svc = self.clone();
-        tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(60));
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            ticker.tick().await;
-            loop {
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = ticker.tick() => {
-                        if let Err(e) = svc.pickup_fresh().await {
-                            warn!(error = %e, "fresh-pickup failed");
-                        }
-                    }
-                }
-            }
-        });
-    }
-
-    async fn pickup_fresh(self: &Arc<Self>) -> AppResult<()> {
-        let rows: Vec<(Uuid,)> = sqlx::query_as(
-            "SELECT id FROM artists
-             WHERE merged_into IS NULL
-               AND last_crawled_at IS NULL
-               AND confidence >= 0.5
-               AND crawl_attempts < $1
-               AND (mb_artist_id IS NOT NULL OR genius_artist_id IS NOT NULL)
-             ORDER BY confidence DESC, created_at
-             LIMIT 5",
-        )
-        .bind(self.cfg.max_attempts as i16)
-        .fetch_all(&self.pg)
-        .await?;
-        if rows.is_empty() {
-            return Ok(());
-        }
-        info!(count = rows.len(), "artist crawl: fresh-pickup batch");
-        for (artist_id,) in rows {
-            let svc = self.clone();
-            tokio::spawn(async move {
-                if let Err(e) = svc.run_for_artist(artist_id).await {
-                    warn!(%artist_id, error = %e, "fresh-pickup run_for_artist failed");
-                }
-            });
-        }
-        Ok(())
     }
 
     pub async fn run_for_artist(self: &Arc<Self>, artist_id: Uuid) -> AppResult<()> {
@@ -235,7 +91,7 @@ impl ArtistCrawlService {
         .await
     }
 
-    async fn crawl_one(
+    pub async fn crawl_one(
         &self,
         artist_id: Uuid,
         mb_id: Option<&str>,
@@ -312,18 +168,28 @@ impl ArtistCrawlService {
             }
         }
         if let Some(gid) = genius_id.and_then(|s| s.parse::<i64>().ok()) {
-            match self
+            let songs_res = self
                 .discover_genius_songs(artist_id, gid, genius_offset)
-                .await
-            {
-                Ok(next) => {
-                    self.set_crawl_offset(artist_id, CrawlSource::Genius, next)
-                        .await?
-                }
-                Err(e) => debug!(artist = %artist_id, error = %e, "Genius song discovery failed"),
+                .await;
+            if let Ok(next) = &songs_res {
+                self.set_crawl_offset(artist_id, CrawlSource::Genius, *next)
+                    .await?;
             }
-            if let Err(e) = self.discover_genius_albums(artist_id, gid).await {
-                debug!(artist = %artist_id, error = %e, "Genius album discovery failed");
+            let albums_res = self.discover_genius_albums(artist_id, gid).await;
+            // Propagate Genius transport/DB failures (→ backoff via on_failure), but
+            // swallow parse failures: a bad parse means a fleet-wide envelope change,
+            // not a per-artist signal, and must not march every artist to crawl_dead.
+            for (label, res) in [
+                ("genius songs", songs_res.map(|_| ())),
+                ("genius albums", albums_res),
+            ] {
+                match res {
+                    Ok(()) => {}
+                    Err(AppError::Internal(_)) => {
+                        warn!(artist = %artist_id, label, "genius parse failure swallowed")
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
         if let Some(sc_user_id) = sc_user_id {
@@ -343,7 +209,7 @@ impl ArtistCrawlService {
             if kind != "soundcloud" || !is_soundcloud_url(url) {
                 continue;
             }
-            let value = match self.resolve.resolve(None, url).await {
+            let value = match self.resolve.resolve(TokenKind::PublicPool, url).await {
                 Ok(v) => v,
                 Err(e) => {
                     debug!(url, error = %e, "resolve sc url failed");
@@ -413,24 +279,34 @@ impl ArtistCrawlService {
     async fn discover_genius_albums(&self, artist_id: Uuid, genius_id: i64) -> AppResult<()> {
         let mut page = 1u32;
         for _ in 0..10 {
-            let (albums, has_more) = self.genius.list_artist_albums(genius_id, page, 20).await;
+            let (albums, has_more) = self.genius.list_artist_albums(genius_id, page, 20).await?;
             if albums.is_empty() {
                 break;
             }
-            for album_ref in albums {
+            join_all(albums.into_iter().map(|album_ref| {
                 let year_hint = album_ref.year;
                 let genius_album_id = album_ref.genius_album_id;
-                let album_id = self
-                    .ensure_genius_album(album_ref, Some(artist_id), year_hint)
-                    .await?;
-                let Some(album_id) = album_id else { continue };
-                if let Err(e) = self
-                    .ingest_genius_album_tracks(artist_id, album_id, genius_album_id)
-                    .await
-                {
-                    debug!(album_id = %album_id, error = %e, "Genius album tracks ingest failed");
+                async move {
+                    let album_id = match self
+                        .ensure_genius_album(album_ref, Some(artist_id), year_hint)
+                        .await
+                    {
+                        Ok(Some(id)) => id,
+                        Ok(None) => return,
+                        Err(e) => {
+                            debug!(error = %e, "ensure_genius_album failed");
+                            return;
+                        }
+                    };
+                    if let Err(e) = self
+                        .ingest_genius_album_tracks(artist_id, album_id, genius_album_id)
+                        .await
+                    {
+                        debug!(album_id = %album_id, error = %e, "Genius album tracks ingest failed");
+                    }
                 }
-            }
+            }))
+                .await;
             if !has_more {
                 return Ok(());
             }
@@ -445,12 +321,11 @@ impl ArtistCrawlService {
         album_id: Uuid,
         genius_album_id: i64,
     ) -> AppResult<()> {
-        let mut page = 1u32;
-        for _ in 0..6 {
+        for page in 1u32..=6 {
             let (tracks, has_more) = self
                 .genius
                 .list_album_tracks(genius_album_id, page, 50)
-                .await;
+                .await?;
             if tracks.is_empty() {
                 break;
             }
@@ -465,7 +340,6 @@ impl ArtistCrawlService {
             if !has_more {
                 return Ok(());
             }
-            page += 1;
         }
         Ok(())
     }
@@ -550,24 +424,24 @@ impl ArtistCrawlService {
 
     async fn link_indexed_album_with_position(
         &self,
-        indexed_track_id: Uuid,
+        track_id: Uuid,
         album_id: Uuid,
         position: i16,
     ) -> AppResult<()> {
         sqlx::query(
-            "UPDATE indexed_tracks SET album_id = COALESCE(album_id, $2), album_position = COALESCE(album_position, $3) WHERE id = $1",
+            "UPDATE tracks SET album_id = COALESCE(album_id, $2), album_position = COALESCE(album_position, $3) WHERE id = $1",
         )
-        .bind(indexed_track_id)
+        .bind(track_id)
         .bind(album_id)
         .bind(position)
         .execute(&self.pg)
         .await?;
         sqlx::query(
-            "INSERT INTO album_tracks (album_id, indexed_track_id, position) VALUES ($1, $2, $3)
+            "INSERT INTO album_tracks (album_id, track_id, position) VALUES ($1, $2, $3)
              ON CONFLICT DO NOTHING",
         )
         .bind(album_id)
-        .bind(indexed_track_id)
+        .bind(track_id)
         .bind(position)
         .execute(&self.pg)
         .await?;
@@ -586,10 +460,16 @@ impl ArtistCrawlService {
             let songs = self
                 .genius
                 .list_artist_songs(genius_id, page, GENIUS_PAGE_SIZE)
-                .await;
+                .await?;
             let count = songs.len() as u32;
-            for song in songs {
-                if let Err(e) = self.persist_genius_song(artist_id, genius_id, song).await {
+            let results = join_all(
+                songs
+                    .into_iter()
+                    .map(|song| self.persist_genius_song(artist_id, genius_id, song)),
+            )
+                .await;
+            for r in results {
+                if let Err(e) = r {
                     debug!(error = %e, "wanted_track upsert (genius) failed");
                 }
             }
@@ -1036,11 +916,10 @@ impl ArtistCrawlService {
     }
 
     async fn indexed_track_has_isrc(&self, isrc: &str) -> AppResult<bool> {
-        let row: Option<(Uuid,)> =
-            sqlx::query_as("SELECT id FROM indexed_tracks WHERE isrc = $1 LIMIT 1")
-                .bind(isrc)
-                .fetch_optional(&self.pg)
-                .await?;
+        let row: Option<(Uuid,)> = sqlx::query_as("SELECT id FROM tracks WHERE isrc = $1 LIMIT 1")
+            .bind(isrc)
+            .fetch_optional(&self.pg)
+            .await?;
         Ok(row.is_some())
     }
 
@@ -1056,46 +935,47 @@ impl ArtistCrawlService {
                 target_title,
             )
             .await?
-            .map(|m| m.indexed_track_id),
+            .map(|m| m.track_id),
         )
     }
 
-    async fn link_indexed_album(&self, indexed_track_id: Uuid, album_id: Uuid) -> AppResult<()> {
-        sqlx::query("UPDATE indexed_tracks SET album_id = COALESCE(album_id, $2) WHERE id = $1")
-            .bind(indexed_track_id)
+    async fn link_indexed_album(&self, track_id: Uuid, album_id: Uuid) -> AppResult<()> {
+        sqlx::query("UPDATE tracks SET album_id = COALESCE(album_id, $2) WHERE id = $1")
+            .bind(track_id)
             .bind(album_id)
             .execute(&self.pg)
             .await?;
         sqlx::query(
-            "INSERT INTO album_tracks (album_id, indexed_track_id) VALUES ($1, $2)
+            "INSERT INTO album_tracks (album_id, track_id) VALUES ($1, $2)
              ON CONFLICT DO NOTHING",
         )
         .bind(album_id)
-        .bind(indexed_track_id)
+        .bind(track_id)
         .execute(&self.pg)
         .await?;
         Ok(())
     }
 
     async fn fetch_sc_web_profiles(&self, artist_id: Uuid, sc_user_id: &str) -> AppResult<()> {
-        let tokens = self.tokens.pick_for_background(SC_TOKEN_EXTRA).await?;
-        if tokens.is_empty() {
-            return Ok(());
-        }
+        let chain = match self.tokens.chain(TokenKind::PublicPool).await {
+            Ok(c) => c,
+            Err(_) => return Ok(()),
+        };
         let path = format!("/users/soundcloud:users:{sc_user_id}/web-profiles");
-        for token in tokens {
-            match self.sc.api_get_value(&path, &token, None).await {
-                Ok(value) => {
-                    let socials = parse_sc_web_profiles(&value);
-                    if !socials.is_empty() {
-                        self.upsert_socials(artist_id, &socials).await?;
-                    }
-                    return Ok(());
-                }
-                Err(e) => {
-                    debug!(artist = %artist_id, error = %e, "SC web-profiles attempt failed");
+        match try_with_chain(&chain, |t| {
+            let sc = self.sc.clone();
+            let path = path.clone();
+            async move { sc.api_get_value(&path, &t, None).await }
+        })
+        .await
+        {
+            Ok(value) => {
+                let socials = parse_sc_web_profiles(&value);
+                if !socials.is_empty() {
+                    self.upsert_socials(artist_id, &socials).await?;
                 }
             }
+            Err(e) => debug!(artist = %artist_id, error = %e, "SC web-profiles failed"),
         }
         Ok(())
     }

@@ -6,6 +6,7 @@ use axum::extract::{Multipart, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::Json;
+use subtle::ConstantTimeEq;
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 
@@ -109,11 +110,18 @@ pub async fn upload(
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or((StatusCode::UNAUTHORIZED, "missing token".into()))?;
 
-    if token != state.config.admin_token {
+    if state.config.admin_token.is_empty()
+        || token
+            .as_bytes()
+            .ct_eq(state.config.admin_token.as_bytes())
+            .unwrap_u8()
+            != 1
+    {
         return Err((StatusCode::FORBIDDEN, "invalid token".into()));
     }
 
     let mut filename: Option<String> = None;
+    let mut quality: Option<String> = None;
     let mut tmp_file_path: Option<std::path::PathBuf> = None;
     let mut reservation = TmpReservation::new(&state);
     let source_dir = state.config.source_path();
@@ -132,6 +140,14 @@ pub async fn upload(
                         .text()
                         .await
                         .map_err(|e| (StatusCode::BAD_REQUEST, format!("read filename: {e}")))?,
+                );
+            }
+            "quality" => {
+                quality = Some(
+                    field
+                        .text()
+                        .await
+                        .map_err(|e| (StatusCode::BAD_REQUEST, format!("read quality: {e}")))?,
                 );
             }
             "file" => {
@@ -207,10 +223,30 @@ pub async fn upload(
         return Err((StatusCode::BAD_REQUEST, "invalid filename".into()));
     }
 
+    // Enforce the canonical `soundcloud_tracks_<id>` object name at the storage
+    // boundary — coerces a bare numeric id, rejects anything non-canonical, so a
+    // stray bare `<id>.m4a` can never be written regardless of the caller.
+    let filename = match crate::backend::canonical_track_filename(&filename) {
+        Some(c) => c,
+        None => {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            warn!("[upload] rejected non-canonical filename {filename:?}");
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "filename must be a canonical soundcloud_tracks_<id> track name".into(),
+            ));
+        }
+    };
+
+    let quality = normalize_quality(quality.as_deref());
+
     let file_lock = state.file_lock(&filename);
     let _file_guard = file_lock.lock().await;
 
-    let result = state.pipeline.submit(tmp_path, filename.clone()).await;
+    let result = state
+        .pipeline
+        .submit(tmp_path, filename.clone(), quality)
+        .await;
     drop(reservation);
 
     let output = match result {
@@ -220,6 +256,13 @@ pub async fn upload(
             return Err((
                 StatusCode::CONFLICT,
                 format!("transcode skipped: short track ({duration_secs:.3}s)"),
+            ));
+        }
+        Err(PipelineError::TrackTooLong { duration_secs, .. }) => {
+            info!("[upload] skipped long track {filename}: {duration_secs:.3}s");
+            return Err((
+                StatusCode::CONFLICT,
+                format!("transcode skipped: long track ({duration_secs:.3}s)"),
             ));
         }
         Err(PipelineError::Ffmpeg(msg)) => {
@@ -247,6 +290,15 @@ pub async fn upload(
         path: format!("{filename}.m4a"),
         duration_secs: output.duration_secs,
     }))
+}
+
+/// Clamp the caller-supplied quality to a known value; anything unrecognized
+/// (or absent) is treated as `sq` so it gets picked up for an hq upgrade later.
+fn normalize_quality(q: Option<&str>) -> &'static str {
+    match q.map(str::trim) {
+        Some("hq") => "hq",
+        _ => "sq",
+    }
 }
 
 fn sanitize_filename(s: &str) -> String {

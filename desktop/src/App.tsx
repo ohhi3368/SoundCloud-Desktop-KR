@@ -1,24 +1,28 @@
-import { lazy, type ReactNode, Suspense, useCallback, useEffect, useRef, useState } from 'react';
-import { useTranslation } from 'react-i18next';
-import { BrowserRouter, Navigate, Route, Routes } from 'react-router-dom';
-import { Toaster } from 'sonner';
-import { useShallow } from 'zustand/shallow';
-import { AppShell } from './components/layout/AppShell';
+import {lazy, type ReactNode, Suspense, useCallback, useEffect, useRef, useState} from 'react';
+import {useTranslation} from 'react-i18next';
+import {BrowserRouter, Navigate, Route, Routes} from 'react-router-dom';
+import {Toaster} from 'sonner';
+import {useShallow} from 'zustand/shallow';
+import {ErrorBoundary} from './components/ErrorBoundary';
+import {AppShell} from './components/layout/AppShell';
 import YMImportFloatingStatus from './components/music/YMImportFloatingStatus';
-import { SessionRecoveryModal } from './components/SessionRecoveryModal';
-import { ThemeProvider } from './components/ThemeProvider';
-import { ApiError } from './lib/api';
-import { CHECK_UPDATES } from './lib/constants';
-import { initDpiSync } from './lib/dpi';
-import { checkForAppUpdate, type GithubRelease } from './lib/update-check';
-import { getAppMode, useAppStatusStore } from './stores/app-status';
-import { useAuthStore } from './stores/auth';
-import { type StartupPage, useSettingsStore } from './stores/settings';
-import { useYmImportStore } from './stores/ym-import';
+import {SessionRecoveryModal} from './components/SessionRecoveryModal';
+import {ThemeProvider} from './components/ThemeProvider';
+import {ApiError} from './lib/api';
+import {CHECK_UPDATES} from './lib/constants';
+import {initDpiSync} from './lib/dpi';
+import {checkForAppUpdate, type GithubRelease} from './lib/update-check';
+import {getAppMode, useAppStatusStore} from './stores/app-status';
+import {useAuthStore} from './stores/auth';
+import {type StartupPage, useSettingsStore} from './stores/settings';
+import {useYmImportStore} from './stores/ym-import';
 
 const Home = lazy(() => import('./pages/Home').then((module) => ({ default: module.Home })));
 const Library = lazy(() =>
   import('./pages/Library').then((module) => ({ default: module.Library })),
+);
+const LibraryCollection = lazy(() =>
+    import('./pages/LibraryCollection').then((module) => ({default: module.LibraryCollection})),
 );
 const Login = lazy(() => import('./pages/Login').then((module) => ({ default: module.Login })));
 const PlaylistPage = lazy(() =>
@@ -62,7 +66,7 @@ const STARTUP_PAGE_ROUTES: Record<StartupPage, string> = {
 
 function StartPageRedirect() {
   const startupPage = useSettingsStore((s) => s.startupPage);
-  return <Navigate to={STARTUP_PAGE_ROUTES[startupPage]} replace />;
+    return <Navigate to={STARTUP_PAGE_ROUTES[startupPage] ?? '/home'} replace/>;
 }
 
 export default function App() {
@@ -258,6 +262,14 @@ export default function App() {
                     </RouteLoader>
                   }
                 />
+                  <Route
+                      path="library/:section"
+                      element={
+                          <RouteLoader>
+                              <LibraryCollection/>
+                          </RouteLoader>
+                  }
+                />
                 <Route
                   path="offline"
                   element={
@@ -332,7 +344,11 @@ export default function App() {
 }
 
 function RouteLoader({ children }: { children: ReactNode }) {
-  return <Suspense fallback={<AppLoadingScreen />}>{children}</Suspense>;
+    return (
+        <Suspense fallback={<AppLoadingScreen/>}>
+            <ErrorBoundary>{children}</ErrorBoundary>
+        </Suspense>
+    );
 }
 
 function AppLoadingScreen({ fullscreen = false }: { fullscreen?: boolean }) {

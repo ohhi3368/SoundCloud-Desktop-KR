@@ -5,10 +5,11 @@ use bytes::Bytes;
 use mini_moka::sync::Cache;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::{Mutex as AsyncMutex, Semaphore};
 use tracing::debug;
 
 use crate::modules::indexing::IndexingService;
+use crate::modules::tracks::TrackPriority;
 use crate::sc::{ScClient, TrackObserver};
 
 static URN_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"soundcloud:tracks:(\d+)").unwrap());
@@ -18,12 +19,14 @@ const SEEN_CAPACITY: u64 = 20_000;
 const INFLIGHT_CAPACITY: u64 = 4096;
 const INFLIGHT_TTL: Duration = Duration::from_secs(2 * 60);
 const MAX_BODY_SCAN_BYTES: usize = 512 * 1024;
+const DISCOVERY_CONCURRENCY: usize = 16;
 
 pub struct TrackDiscoveryService {
     sc: ScClient,
     indexing: Arc<IndexingService>,
     recently_seen: Cache<String, ()>,
     inflight: Cache<String, Arc<AsyncMutex<()>>>,
+    sem: Arc<Semaphore>,
     weak_self: Weak<Self>,
 }
 
@@ -40,6 +43,7 @@ impl TrackDiscoveryService {
                 .max_capacity(INFLIGHT_CAPACITY)
                 .time_to_idle(INFLIGHT_TTL)
                 .build(),
+            sem: Arc::new(Semaphore::new(DISCOVERY_CONCURRENCY)),
             weak_self: weak.clone(),
         })
     }
@@ -67,8 +71,12 @@ impl TrackDiscoveryService {
             .await
         {
             Ok(track) => {
-                if let Err(e) = self.indexing.ensure_track_indexed(&track).await {
-                    debug!(track = %sc_track_id, error = %e, "ensure_track_indexed failed");
+                if let Err(e) = self
+                    .indexing
+                    .ingest_track_from_sc(&track, TrackPriority::Discovery)
+                    .await
+                {
+                    debug!(track = %sc_track_id, error = %e, "ingest_track_from_sc failed");
                 }
             }
             Err(e) => {
@@ -106,9 +114,17 @@ impl TrackObserver for TrackDiscoveryService {
             return;
         };
         for id in fresh {
+            // best-effort: при насыщении сбрасываем хвост (TTL recently_seen
+            // даст переоткрыть позже), не плодим неограниченные фоновые таски.
+            let Ok(permit) = svc_arc.sem.clone().try_acquire_owned() else {
+                break;
+            };
             let svc = svc_arc.clone();
             let token = access_token.clone();
-            tokio::spawn(async move { svc.run_one(id, token).await });
+            tokio::spawn(async move {
+                let _permit = permit;
+                svc.run_one(id, token).await;
+            });
         }
     }
 }

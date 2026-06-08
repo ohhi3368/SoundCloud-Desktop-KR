@@ -60,8 +60,11 @@ pub async fn stream(
     query: Query<StreamQuery>,
 ) -> Result<Response, AppError> {
     let urn_for_log = track_urn.0.clone();
-    match tokio::time::timeout(STREAM_DEADLINE, stream_inner(state, track_urn, headers, query))
-        .await
+    match tokio::time::timeout(
+        STREAM_DEADLINE,
+        stream_inner(state, track_urn, headers, query),
+    )
+    .await
     {
         Ok(r) => r,
         Err(_) => {
@@ -108,11 +111,11 @@ async fn stream_inner(
     if hq {
         if let Some(r) = try_oauth(&state, access, &track_urn, secret_token, true).await {
             info!("{tag} {track_urn} → oauth/hq");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "hq");
         }
         if let Some(r) = try_cookies(&state, &track_urn, tag, true).await {
             info!("{tag} {track_urn} → cookies/hq");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "hq");
         }
         if let Some(r) = try_restricted(&state, &track_urn, tag, true).await {
             info!("{tag} {track_urn} → restricted/hq");
@@ -120,29 +123,29 @@ async fn stream_inner(
         }
         if let Some(r) = try_oauth(&state, access, &track_urn, secret_token, false).await {
             info!("{tag} {track_urn} → oauth/sq");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
         }
         if let Some(r) = try_anon(&state, &track_urn, tag).await {
             info!("{tag} {track_urn} → anon");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
         }
         if let Some(r) = try_cookies(&state, &track_urn, tag, false).await {
             info!("{tag} {track_urn} → cookies/sq");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
         }
     } else {
         if let Some(r) = try_oauth(&state, access, &track_urn, secret_token, false).await {
             info!("{tag} {track_urn} → oauth");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
         }
         if let Some(r) = try_anon(&state, &track_urn, tag).await {
             info!("{tag} {track_urn} → anon");
-            return respond_with_data(&state, &track_urn, r.0, r.1);
+            return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
         }
         if is_premium {
             if let Some(r) = try_cookies(&state, &track_urn, tag, false).await {
                 info!("{tag} {track_urn} → cookies");
-                return respond_with_data(&state, &track_urn, r.0, r.1);
+                return respond_with_data(&state, &track_urn, r.0, r.1, "sq");
             }
         }
     }
@@ -179,18 +182,16 @@ async fn try_oauth(
     secret_token: Option<&str>,
     hq_only: bool,
 ) -> Option<(Bytes, &'static str)> {
-    let result = super::oauth::try_oauth_stream(
-        &state.http_client,
-        &state.pg,
-        &state.config.sc_proxy_url,
-        state.config.sc_proxy_fallback,
-        state.config.sc_oauth_fallback_sessions,
-        access_token,
-        track_urn,
-        secret_token,
-        hq_only,
-    )
-    .await?;
+    let ctx = super::oauth::OauthCtx {
+        client: &state.http_client,
+        pg: &state.pg,
+        proxy_url: &state.config.sc_proxy_url,
+        proxy_fallback: state.config.sc_proxy_fallback,
+        fallback_session_count: state.config.sc_oauth_fallback_sessions,
+    };
+    let result =
+        super::oauth::try_oauth_stream(&ctx, access_token, track_urn, secret_token, hq_only)
+            .await?;
     Some((result.data, result.content_type))
 }
 
@@ -279,6 +280,7 @@ async fn try_restricted(
     let acc_w = acc.clone();
     let storage = state.storage.clone();
     let urn = track_urn.to_string();
+    let quality = if src.is_hq { "hq" } else { "sq" };
     let teed = stream
         .map(move |chunk| {
             if let Ok(b) = &chunk {
@@ -289,7 +291,7 @@ async fn try_restricted(
         .chain(futures::stream::once(async move {
             let data = std::mem::take(&mut *acc.lock().unwrap());
             if data.len() > 8192 {
-                storage.upload_in_background(urn, Bytes::from(data));
+                storage.upload_in_background_with_quality(urn, Bytes::from(data), quality);
             }
             Ok::<_, decrypt::Error>(Bytes::new())
         }));
@@ -323,11 +325,14 @@ fn respond_with_data(
     track_urn: &str,
     data: Bytes,
     content_type: &'static str,
+    quality: &'static str,
 ) -> Result<Response, AppError> {
     if data.len() > 8192 {
-        state
-            .storage
-            .upload_in_background(track_urn.to_string(), data.clone());
+        state.storage.upload_in_background_with_quality(
+            track_urn.to_string(),
+            data.clone(),
+            quality,
+        );
     }
 
     Ok(Response::builder()

@@ -17,6 +17,11 @@ pub enum PipelineError {
         duration_secs: f64,
         min_duration_secs: f64,
     },
+    #[error("track too long: {duration_secs:.3}s > {max_duration_secs:.3}s")]
+    TrackTooLong {
+        duration_secs: f64,
+        max_duration_secs: f64,
+    },
     #[error("ffmpeg: {0}")]
     Ffmpeg(String),
     #[error("backend: {0}")]
@@ -36,6 +41,9 @@ pub struct Pipeline {
 struct PipelineJob {
     source: PathBuf,
     filename: String,
+    /// `sq`/`hq` — forwarded into the `storage.track_uploaded` event so the
+    /// backend records `storage_quality` correctly.
+    quality: &'static str,
     reply: oneshot::Sender<Result<PipelineOutput, PipelineError>>,
 }
 
@@ -53,6 +61,7 @@ impl Pipeline {
         &self,
         source: PathBuf,
         filename: String,
+        quality: &'static str,
     ) -> Result<PipelineOutput, PipelineError> {
         let (tx, rx) = oneshot::channel();
         if self
@@ -60,6 +69,7 @@ impl Pipeline {
             .send(PipelineJob {
                 source: source.clone(),
                 filename,
+                quality,
                 reply: tx,
             })
             .await
@@ -148,6 +158,15 @@ async fn run_batch(
             }));
             continue;
         }
+        let max = config.max_upload_duration_secs;
+        if max > 0.0 && secs > max {
+            let _ = tokio::fs::remove_file(&job.source).await;
+            let _ = job.reply.send(Err(PipelineError::TrackTooLong {
+                duration_secs: secs,
+                max_duration_secs: max,
+            }));
+            continue;
+        }
         let out = transcode::stage_output(&config.result_path(), &job.filename);
         accepted.push((job, secs, out));
     }
@@ -188,7 +207,7 @@ async fn run_batch(
                     let single = transcode::run_ffmpeg_batch(
                         &cfg.ffmpeg_bin,
                         &[job.source.as_path()],
-                        &[out.clone()],
+                        std::slice::from_ref(&out),
                     )
                     .await;
                     match single {
@@ -229,7 +248,7 @@ fn spawn_commit(
         let res = commit_single(&bk, &wp, &cfg, &job.filename, out).await;
         let _ = tokio::fs::remove_file(&job.source).await;
         if res.is_ok() {
-            publish_uploaded(&bs, &cfg, &job.filename);
+            publish_uploaded(&bs, &cfg, &job.filename, job.quality);
         }
         let _ = job
             .reply
@@ -237,7 +256,7 @@ fn spawn_commit(
     });
 }
 
-fn publish_uploaded(bus: &BusClient, config: &Config, filename: &str) {
+fn publish_uploaded(bus: &BusClient, config: &Config, filename: &str, quality: &'static str) {
     if !bus.enabled() || config.event_base_url.is_empty() {
         return;
     }
@@ -245,7 +264,7 @@ fn publish_uploaded(bus: &BusClient, config: &Config, filename: &str) {
         return;
     };
     let storage_url = format!("{}/redirect/{}.m4a", config.event_base_url, filename);
-    bus.publish_track_uploaded(sc_track_id, storage_url);
+    bus.publish_track_uploaded(sc_track_id, storage_url, quality);
 }
 
 async fn commit_single(

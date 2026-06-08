@@ -11,6 +11,10 @@ pub enum BackendKind {
 #[derive(Clone, Debug)]
 pub struct S3Config {
     pub endpoint: Option<String>,
+    /// Endpoint, используемый только для presigned URLs (`/redirect/...`).
+    /// Если задан — должен быть публично резолвящимся, чтобы внешний воркер
+    /// мог по нему пойти; иначе presign берёт `endpoint`.
+    pub presign_endpoint: Option<String>,
     pub region: String,
     pub bucket: String,
     pub access_key_id: String,
@@ -23,10 +27,14 @@ pub enum GdriveAuth {
     /// JSON service-account ключа (как из GCP Console). Работает только с Shared Drive
     /// или domain-wide delegation — в личный My Drive Google запрещает с 2024.
     ServiceAccount(String),
-    /// OAuth user creds: client_id + client_secret (от Desktop OAuth-app в GCP)
-    /// + refresh_token живого Google-аккаунта (получается один раз через consent flow,
-    /// см. tools/get-refresh-token.sh). Файлы пишутся в My Drive этого юзера и
-    /// занимают его квоту (или его долю в Google One family pool).
+    /// OAuth user creds (Desktop OAuth-app в GCP):
+    ///
+    /// - `client_id` + `client_secret` (из GCP консоли),
+    /// - `refresh_token` живого Google-аккаунта (получается один раз через consent
+    ///   flow, см. `tools/get-refresh-token.sh`).
+    ///
+    /// Файлы пишутся в My Drive этого юзера и занимают его квоту (или его долю
+    /// в Google One family pool).
     UserOAuth {
         client_id: String,
         client_secret: String,
@@ -64,6 +72,9 @@ pub struct Config {
     pub transcode_batch_size: usize,
     /// Сколько ждём добор батча, прежде чем стрелять ffmpeg-ом.
     pub transcode_batch_wait_ms: u64,
+    /// Макс. длительность трека (сек). Длиннее — не транскодятся и отклоняются
+    /// на /upload (по аналогии с backend `MAX_TRACK_DURATION_SEC`). 0 = без лимита.
+    pub max_upload_duration_secs: f64,
     /// Параллельные backend-загрузки (S3 PUT / local rename).
     pub upload_concurrency: usize,
     /// Сколько раз ретраить одну backend-загрузку (на ошибки).
@@ -137,6 +148,9 @@ impl Config {
         let s3 = if backend == BackendKind::S3 {
             Some(S3Config {
                 endpoint: env::var("S3_ENDPOINT").ok().filter(|v| !v.is_empty()),
+                presign_endpoint: env::var("S3_PRESIGN_ENDPOINT")
+                    .ok()
+                    .filter(|v| !v.is_empty()),
                 region: env::var("S3_REGION").unwrap_or_else(|_| "us-east-1".into()),
                 bucket: env::var("S3_BUCKET").expect("S3_BUCKET is required for s3 backend"),
                 access_key_id: env::var("S3_ACCESS_KEY_ID")
@@ -207,6 +221,7 @@ impl Config {
             ),
             transcode_batch_size: parse_env_usize("TRANSCODE_BATCH_SIZE", 8),
             transcode_batch_wait_ms: parse_env_u64("TRANSCODE_BATCH_WAIT_MS", 50),
+            max_upload_duration_secs: parse_env_u64("MAX_TRACK_DURATION_SEC", 420) as f64,
             upload_concurrency: parse_env_usize("UPLOAD_CONCURRENCY", 64),
             upload_retries: parse_env_usize("UPLOAD_RETRIES", 4),
             upload_retry_base_ms: parse_env_u64("UPLOAD_RETRY_BASE_MS", 250),

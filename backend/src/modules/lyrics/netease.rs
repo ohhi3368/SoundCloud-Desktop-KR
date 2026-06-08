@@ -73,7 +73,7 @@ impl NeteaseService {
     }
 
     pub async fn search_by_query(&self, q: &str, limit: usize) -> Vec<NeteaseResult> {
-        let limit = limit.max(1).min(SEARCH_LIMIT);
+        let limit = limit.clamp(1, SEARCH_LIMIT);
         let songs = self.search(q, limit).await;
         if songs.is_empty() {
             return Vec::new();
@@ -84,7 +84,7 @@ impl NeteaseService {
             .collect::<Vec<_>>();
         let lyrics_res = join_all(lyrics_futs).await;
         let mut out = Vec::new();
-        for (song, lyric) in songs.into_iter().zip(lyrics_res.into_iter()) {
+        for (song, lyric) in songs.into_iter().zip(lyrics_res) {
             let Some(lrc) = lyric else { continue };
             let artists = song.artists.clone().or(song.ar.clone()).unwrap_or_default();
             let artist_guess: String = artists

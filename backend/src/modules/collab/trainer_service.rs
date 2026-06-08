@@ -3,16 +3,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use futures::TryStreamExt;
+use serde::Deserialize;
 use serde_json::json;
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::bus::nats::NatsService;
-use crate::bus::subjects::subjects;
+use crate::bus::subjects::{self, streams};
 use crate::config::CollabCfg;
 use crate::error::AppResult;
 use crate::modules::collab::vector_service::CollabVectorService;
+use crate::qdrant::QdrantService;
+
+#[derive(Debug, Deserialize)]
+struct CollabBlob {
+    dim: u64,
+    points: Vec<CollabPoint>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CollabPoint {
+    id: u64,
+    vec: Vec<f32>,
+}
 
 const SESSION_GAP_MS: i64 = 30 * 60 * 1000;
 const MIN_SESSION_LEN: usize = 2;
@@ -23,6 +38,7 @@ const SESSION_EVENTS: &[&str] = &["like", "playlist_add", "full_play", "skip"];
 pub struct CollabTrainerService {
     pg: PgPool,
     nats: Arc<NatsService>,
+    qdrant: Arc<QdrantService>,
     collab: Arc<CollabVectorService>,
     cfg: CollabCfg,
     in_progress: AtomicBool,
@@ -41,12 +57,14 @@ impl CollabTrainerService {
     pub fn new(
         pg: PgPool,
         nats: Arc<NatsService>,
+        qdrant: Arc<QdrantService>,
         collab: Arc<CollabVectorService>,
         cfg: CollabCfg,
     ) -> Arc<Self> {
         Arc::new(Self {
             pg,
             nats,
+            qdrant,
             collab,
             cfg,
             in_progress: AtomicBool::new(false),
@@ -55,7 +73,66 @@ impl CollabTrainerService {
         })
     }
 
+    /// Воркер тренирует Word2Vec и кладёт вектора блобом в Object Store, в
+    /// `done.train_collab` едет имя объекта + dim. Backend читает блоб и пишет
+    /// в Qdrant — единственная точка записи collab-векторов.
+    fn spawn_done_consumer(self: &Arc<Self>) {
+        let svc = self.clone();
+        self.nats.consume(
+            streams::DONE.name,
+            "backend-done-train-collab",
+            Some(subjects::DONE_TRAIN_COLLAB),
+            1,
+            move |data| {
+                let svc = svc.clone();
+                async move {
+                    if !data
+                        .get("trained")
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false)
+                    {
+                        return Ok(());
+                    }
+                    // Нет object → старый воркер писал в Qdrant сам (rolling deploy).
+                    let Some(object) = data.get("object").and_then(|v| v.as_str()) else {
+                        return Ok(());
+                    };
+                    let blob: CollabBlob = svc
+                        .nats
+                        .get_object(subjects::COLLAB_DATA_BUCKET, object)
+                        .await?;
+                    if blob.dim == 0 {
+                        warn!(object, "[collab] blob dim=0, skip");
+                        let _ = svc
+                            .nats
+                            .delete_object(subjects::COLLAB_DATA_BUCKET, object)
+                            .await;
+                        return Ok(());
+                    }
+                    let points: Vec<(u64, Vec<f32>)> =
+                        blob.points.into_iter().map(|p| (p.id, p.vec)).collect();
+                    let n = svc.qdrant.upsert_collab(blob.dim, points).await?;
+                    if let Err(e) = svc
+                        .nats
+                        .delete_object(subjects::COLLAB_DATA_BUCKET, object)
+                        .await
+                    {
+                        warn!(object, error = %e, "[collab] vectors object cleanup failed");
+                    }
+                    svc.collab.invalidate_all();
+                    info!(
+                        count = n,
+                        dim = blob.dim,
+                        "[collab] vectors upserted from worker"
+                    );
+                    Ok(())
+                }
+            },
+        );
+    }
+
     pub fn spawn_bootstrap_and_cron(self: &Arc<Self>, shutdown: CancellationToken) {
+        self.spawn_done_consumer();
         let svc = self.clone();
         let token = shutdown.clone();
         tokio::spawn(async move {
@@ -171,8 +248,12 @@ impl CollabTrainerService {
             sessions = sessions.len(),
             dim, min_count, "[collab.train] enqueuing"
         );
+        let object = format!("collab-{}", Utc::now().timestamp_millis());
+        self.nats
+            .put_object(subjects::COLLAB_DATA_BUCKET, &object, &sessions)
+            .await?;
         let payload = json!({
-            "sessions": sessions,
+            "object": object,
             "dim": dim,
             "min_count": min_count,
             "window": 5,
@@ -192,15 +273,18 @@ impl CollabTrainerService {
 
     async fn build_sessions(&self) -> AppResult<Vec<Vec<u64>>> {
         let since = Utc::now().naive_utc() - chrono::Duration::days(HISTORY_WINDOW_DAYS);
-        let rows: Vec<(String, String, chrono::NaiveDateTime, String)> = sqlx::query_as(
+        let session_events: Vec<String> = SESSION_EVENTS.iter().map(|s| s.to_string()).collect();
+        // Стримим, а не fetch_all: весь 90д-набор не материализуем в RAM и не
+        // пиним коннект под огромный буфер. event_type фильтруем в SQL.
+        let mut stream = sqlx::query_as::<_, (String, String, chrono::NaiveDateTime, String)>(
             "SELECT sc_user_id, sc_track_id, created_at, event_type FROM user_events \
-             WHERE created_at >= $1 \
+             WHERE created_at >= $1 AND event_type = ANY($2) \
              ORDER BY sc_user_id ASC, created_at ASC",
         )
         .bind(since)
-        .fetch_all(&self.pg)
-        .await?;
-        let total_rows = rows.len();
+            .bind(&session_events)
+            .fetch(&self.pg);
+        let mut total_rows = 0usize;
 
         let mut sessions: Vec<Vec<u64>> = Vec::new();
         let mut current_user: Option<String> = None;
@@ -224,7 +308,10 @@ impl CollabTrainerService {
             seen.clear();
         };
 
-        for (sc_user_id, sc_track_id, created_at, event_type) in rows {
+        while let Some((sc_user_id, sc_track_id, created_at, event_type)) =
+            stream.try_next().await?
+        {
+            total_rows += 1;
             if !session_set.contains(event_type.as_str()) {
                 continue;
             }

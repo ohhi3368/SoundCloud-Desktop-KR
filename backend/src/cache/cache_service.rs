@@ -36,6 +36,17 @@ impl CacheService {
         Arc::new(Self { redis })
     }
 
+    /// Lightweight Redis liveness: a GET that confirms the pool can round-trip.
+    pub async fn ping(&self) -> bool {
+        self.get_raw("__healthcheck__").await.is_ok()
+    }
+
+    /// deadpool counters: (size = in-use + idle, available, max_size).
+    pub fn pool_status(&self) -> (usize, usize, usize) {
+        let s = self.redis.status();
+        (s.size, s.available, s.max_size)
+    }
+
     pub fn build_key(
         &self,
         method: &str,
@@ -147,6 +158,16 @@ impl CacheService {
             .query_async(&mut conn)
             .await?;
         Ok(acquired.is_some())
+    }
+
+    /// Снимает SETNX-лок досрочно. Нужно когда фоновая работа под локом
+    /// сорвалась (например джоб не опубликовался) и переспрос должен
+    /// пере-диспатчиться сразу, не дожидаясь TTL.
+    pub async fn release_lock(&self, key: &str) -> AppResult<()> {
+        let mut conn = self.redis.get().await?;
+        let full = format!("{LOCK_PREFIX}{key}");
+        let _: () = conn.del(full).await?;
+        Ok(())
     }
 
     async fn clear_index(&self, index_key: &str) -> AppResult<()> {

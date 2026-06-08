@@ -1,7 +1,5 @@
-import { useSettingsStore } from '../stores/settings';
-import { BYPASS_IMAGES_BASE, getProxyPort, IMAGES_BASE } from './constants';
-import { isMac } from './platform';
-import { getIsPremium } from './premium-cache';
+import {getProxyPort, IMAGES_BASE} from './constants';
+import {isMac} from './platform';
 
 const WHITELIST = [
   'localhost',
@@ -10,11 +8,6 @@ const WHITELIST = [
   'scproxy.localhost',
   'images.scdinternal.site',
   'api.scdinternal.site',
-  'white.api.scdinternal.site',
-  'white.images.scdinternal.site',
-  'white.storage.scdinternal.site',
-  'white.stream.scdinternal.site',
-  'white.stream-premium.scdinternal.site',
   'unpkg.com',
 ];
 const RETRY_BYPASS_CACHE_PARAM = '__scproxy_bust';
@@ -51,18 +44,24 @@ export function isWhitelistedAssetUrl(url: string): boolean {
 function buildEncodedPayload(
   url: string,
   bypassCache: boolean,
+  upstream: string = IMAGES_BASE,
 ): { encoded: string; target: string } {
   const target = bypassCache ? withCacheBust(url) : url;
-  const bypass = useSettingsStore.getState().bypassWhitelist;
-  const upstreams = bypass && getIsPremium() ? [BYPASS_IMAGES_BASE, IMAGES_BASE] : [IMAGES_BASE];
   return {
-    encoded: encodeURIComponent(btoa(JSON.stringify([target, ...upstreams]))),
+      encoded: encodeURIComponent(btoa(JSON.stringify([target, upstream]))),
     target,
   };
 }
 
-export function toScproxyUrl(url: string, { bypassCache = false } = {}): string {
-  const { encoded, target } = buildEncodedPayload(url, bypassCache);
+/** `direct` makes the local proxy fetch the target itself with a browser
+ *  User-Agent instead of relaying through the image CDN — needed for hosts that
+ *  403 non-browser clients (Wallhaven, Konachan). */
+export function toScproxyUrl(url: string, {bypassCache = false, direct = false} = {}): string {
+    const {encoded, target} = buildEncodedPayload(
+        url,
+        bypassCache,
+        direct ? 'direct' : IMAGES_BASE,
+    );
 
   const proxyPort = getProxyPort();
   if (proxyPort && !isMac()) {

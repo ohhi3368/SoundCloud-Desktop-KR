@@ -1,6 +1,7 @@
-import { useQuery } from '@tanstack/react-query';
-import type { Track } from '../stores/player';
-import { api } from './api';
+import {useQuery} from '@tanstack/react-query';
+import {useCallback, useEffect, useRef, useState} from 'react';
+import type {Track} from '../stores/player';
+import {api} from './api';
 
 export interface RecommendResult {
   id: string | number;
@@ -46,56 +47,217 @@ export async function hydrateByIds(recs: RecommendResult[]): Promise<Track[]> {
   return results.filter((t): t is Track => t !== null);
 }
 
-export type SoundWaveMode = 'similar' | 'diverse';
+export type SmartWaveSeedKind = 'user' | 'track' | 'artist';
+
+export interface SmartWaveBatch {
+  tracks: Track[];
+  cursor: string;
+}
+
+interface SmartWavePayload {
+  tracks: RecommendResult[];
+  cursor: string;
+}
+
+function smartWaveUrl(
+  seedKind: SmartWaveSeedKind,
+  seedId: string | undefined,
+  qs: URLSearchParams,
+): string {
+  switch (seedKind) {
+    case 'user':
+      return `/recommendations/wave${qs.toString() ? `?${qs}` : ''}`;
+    case 'track':
+      return `/recommendations/wave/from-track/${encodeURIComponent(seedId!)}${qs.toString() ? `?${qs}` : ''}`;
+    case 'artist':
+      return `/recommendations/wave/from-artist/${encodeURIComponent(seedId!)}${qs.toString() ? `?${qs}` : ''}`;
+  }
+}
 
 /**
- * Free-form vibe search. Returns hydrated tracks in Qdrant score order.
- * Kept flat (not cluster-grouped) — search is a single-intent query.
+ * Запрос порции бесконечной волны. Сервер держит state по cursor'у
+ * (Redis, TTL 30 мин) — клиент эхает токен и получает свежие треки без
+ * повторов. Если cursor отсутствует или Redis грохнули — сервер начнёт
+ * новую сессию волны, для UX это незаметно.
  */
-export function useSoundWaveSearch(opts: { q: string; languages?: string[]; limit?: number }) {
-  const q = opts.q.trim();
-  const limit = opts.limit ?? 24;
+export async function fetchSmartWave(opts: {
+  seedKind: SmartWaveSeedKind;
+  seedId?: string;
+  cursor?: string;
+  limit?: number;
+  languages?: string[];
+}): Promise<SmartWaveBatch> {
+  const qs = new URLSearchParams();
+  qs.set('limit', String(opts.limit ?? 20));
+  if (opts.cursor) qs.set('cursor', opts.cursor);
+  const languages = normLanguages(opts.languages);
+  if (languages) qs.set('languages', languages);
+
+  const payload = await api<SmartWavePayload>(smartWaveUrl(opts.seedKind, opts.seedId, qs)).catch(
+    () => ({ tracks: [], cursor: '' }) as SmartWavePayload,
+  );
+
+    // Don't trust the API shape: a resolved-but-null/garbage body must not crash.
+    const ids = Array.isArray(payload?.tracks) ? payload.tracks : [];
+    const cursor = payload?.cursor ?? '';
+    if (ids.length === 0) {
+        return {tracks: [], cursor};
+  }
+    const tracks = await hydrateByIds(ids);
+    return {tracks, cursor};
+}
+
+/**
+ * Сообщить серверу о dis/pos исходах в недавнем окне волны.
+ * Cursor обновится на сервере и следующий fetchSmartWave получит выдачу
+ * с адаптированными весами arm'ов.
+ */
+export async function sendWaveFeedback(opts: {
+  cursor: string;
+  negatives: number;
+  positives: number;
+}): Promise<string | null> {
+  if (!opts.cursor) return null;
+  try {
+    const res = await api<{ ok: boolean; cursor?: string | null }>(
+      '/recommendations/wave/feedback',
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(opts),
+      },
+    );
+    return res?.cursor ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * React-Query обёртка для первой порции волны. Дальше работает в паре с
+ * `useInfiniteWave`, который сам шлёт `fetchSmartWave({ cursor })`.
+ */
+export function useSmartWave(opts: {
+  seedKind: SmartWaveSeedKind;
+  seedId?: string;
+  languages?: string[];
+  enabled?: boolean;
+  limit?: number;
+}) {
+  const enabled = opts.enabled !== false && (opts.seedKind === 'user' || !!opts.seedId);
   const languages = normLanguages(opts.languages);
 
-  return useQuery({
-    queryKey: ['soundwave', 'search', q, limit, languages ?? 'all'],
-    enabled: q.length >= 2,
+  return useQuery<SmartWaveBatch>({
+    queryKey: [
+      'smartwave',
+      opts.seedKind,
+      opts.seedId ?? 'self',
+      languages ?? 'all',
+      opts.limit ?? 20,
+    ],
+    enabled,
     staleTime: SW_STALE_MS,
     gcTime: SW_GC_MS,
-    queryFn: async () => {
-      const qs = new URLSearchParams({ q, limit: String(limit) });
-      if (languages) qs.set('languages', languages);
-
-      const recs = await api<RecommendResult[]>(
-        `/recommendations/search?${qs}`,
-        undefined,
-        30_000,
-      ).catch(() => [] as RecommendResult[]);
-      if (!recs.length) return { tracks: [] as Track[], recs };
-
-      const tracks = await hydrateByIds(recs);
-      return { tracks, recs };
-    },
+    queryFn: () =>
+      fetchSmartWave({
+        seedKind: opts.seedKind,
+        seedId: opts.seedId,
+        languages: opts.languages,
+        limit: opts.limit,
+      }),
   });
 }
 
 /**
- * Continuation tail seeded by the last queued track. Used by the infinite scroll
- * extension of the home wave's deep_cuts cluster.
+ * Endless home-wave board for the Search landing — the "затягивающая сетка".
+ *
+ * Курсор волны на бэке STATEFUL (токен = id сессии, позиция двигается в Redis) —
+ * это несовместимо с refetch-моделью `useInfiniteQuery` (рефетч страниц на
+ * stateful-курсоре отдаёт другое → лента вставала после пары экранов). Поэтому
+ * пагинируем ВРУЧНУЮ: только вперёд, append, без рефетча. Плюс при КАЖДОМ заходе
+ * стартуем СВЕЖУЮ волну (топ-треки), а не доигрываем посредственный хвост.
  */
-export async function fetchWaveTailFromSeed(
-  seedTrackId: string,
-  opts: { languages?: string[]; mode: SoundWaveMode; limit?: number },
-): Promise<RecommendResult[]> {
-  const qs = new URLSearchParams({
-    limit: String(opts.limit ?? 20),
-    mode: opts.mode,
-  });
-  const languages = normLanguages(opts.languages);
-  if (languages) qs.set('languages', languages);
-  return api<RecommendResult[]>(
-    `/recommendations/tail/${encodeURIComponent(seedTrackId)}?${qs}`,
-  ).catch(() => [] as RecommendResult[]);
+export function useWaveBoard(opts?: { enabled?: boolean; languages?: string[] }) {
+    const enabled = opts?.enabled !== false;
+    const langKey = normLanguages(opts?.languages) ?? 'all';
+    const languagesRef = useRef(opts?.languages);
+    languagesRef.current = opts?.languages;
+
+    const [tracks, setTracks] = useState<Track[]>([]);
+    const [isLoading, setIsLoading] = useState(false);
+    const [isFetchingNextPage, setIsFetchingNextPage] = useState(false);
+    const [hasNextPage, setHasNextPage] = useState(true);
+
+    const cursorRef = useRef<string | undefined>(undefined);
+    const seenRef = useRef<Set<string>>(new Set());
+    const fetchingRef = useRef(false);
+
+    // Свежий старт при каждом заходе / смене языка: топ волны, не хвост.
+    // biome-ignore lint/correctness/useExhaustiveDependencies: langKey намеренно триггерит fresh-волну при смене языка (значение читаем через ref, чтобы не словить stale-замыкание).
+    useEffect(() => {
+        if (!enabled) {
+            setTracks([]);
+            setHasNextPage(true);
+            return;
+        }
+        let cancelled = false;
+        cursorRef.current = undefined;
+        seenRef.current = new Set();
+        fetchingRef.current = true;
+        setTracks([]);
+        setHasNextPage(true);
+        setIsLoading(true);
+        (async () => {
+            const batch = await fetchSmartWave({
+                seedKind: 'user',
+                limit: 24,
+                languages: languagesRef.current,
+            });
+            if (cancelled) return;
+            cursorRef.current = batch.cursor || undefined;
+            setTracks(dedupeNew(batch.tracks, seenRef.current));
+            setHasNextPage(batch.tracks.length > 0 && !!batch.cursor);
+            setIsLoading(false);
+            fetchingRef.current = false;
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [enabled, langKey]);
+
+    const fetchNextPage = useCallback(async () => {
+        if (!enabled || fetchingRef.current || !hasNextPage) return;
+        fetchingRef.current = true;
+        setIsFetchingNextPage(true);
+        try {
+            const batch = await fetchSmartWave({
+                seedKind: 'user',
+                cursor: cursorRef.current,
+                limit: 24,
+                languages: languagesRef.current,
+            });
+            cursorRef.current = batch.cursor || cursorRef.current;
+            const fresh = dedupeNew(batch.tracks, seenRef.current);
+            if (fresh.length > 0) setTracks((prev) => [...prev, ...fresh]);
+            setHasNextPage(batch.tracks.length > 0); // пусто = волна иссякла
+        } finally {
+            fetchingRef.current = false;
+            setIsFetchingNextPage(false);
+        }
+    }, [enabled, hasNextPage]);
+
+    return {tracks, isLoading, hasNextPage, isFetchingNextPage, fetchNextPage};
+}
+
+function dedupeNew(batch: Track[], seen: Set<string>): Track[] {
+    const out: Track[] = [];
+    for (const t of batch) {
+        if (t?.urn && !seen.has(t.urn)) {
+            seen.add(t.urn);
+            out.push(t);
+        }
+    }
+    return out;
 }
 
 /** Optional lightweight poll of indexing stats. Fails silently if endpoint absent. */

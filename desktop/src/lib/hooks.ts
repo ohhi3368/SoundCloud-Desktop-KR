@@ -13,6 +13,7 @@ import type { Track } from '../stores/player';
 import { api } from './api';
 import { initLikedUrns } from './likes';
 import { rememberLikedTracks, rememberTracks } from './offline-index';
+import {fetchRelatedTracks} from './related';
 
 /* ── Types ─────────────────────────────────────────────────────── */
 
@@ -54,6 +55,7 @@ export interface Comment {
 }
 
 export interface Playlist {
+  kind?: 'playlist' | 'album' | 'ep' | 'single' | 'compilation';
   id: number;
   urn: string;
   title: string;
@@ -64,8 +66,11 @@ export interface Playlist {
   genre: string;
   tag_list: string;
   track_count: number;
-  likes_count: number;
-  repost_count: number;
+  likes_count?: number;
+  repost_count?: number;
+  release_year?: number;
+  release_date?: string;
+  label_name?: string;
   created_at: string;
   last_modified: string;
   sharing: string;
@@ -77,7 +82,7 @@ export interface Playlist {
     urn: string;
     username: string;
     avatar_url: string;
-    permalink_url: string;
+    permalink_url?: string;
     followers_count?: number;
     track_count?: number;
   };
@@ -88,11 +93,14 @@ export interface SCUser {
   urn: string;
   username: string;
   avatar_url: string;
-  permalink_url: string;
+  permalink_url?: string;
   followers_count?: number;
   followings_count?: number;
   track_count?: number;
   city?: string | null;
+  /// Backend now emits `country_code` (ISO-2). Legacy `country` оставляем
+  /// для совместимости со старыми payload'ами SC.
+  country_code?: string | null;
   country?: string | null;
 }
 
@@ -129,6 +137,15 @@ const SHORT_CACHE_MS = 1000 * 60 * 2;
 const MEDIUM_CACHE_MS = 1000 * 60 * 5;
 const SEARCH_CACHE_MS = 1000 * 60 * 2;
 const INFINITE_GC_MS = 1000 * 60 * 3;
+
+/**
+ * Cold-эндпоинты (треки/плейлисты/лайки/фолловинги юзеров, /me/*) живут в
+ * нашей БД и обновляются бэком SWR-cron'ом без участия фронта. tanstack-query
+ * не должен сам дёргать refetch на каждый mount — бэк всё равно отдаст cold
+ * копию мгновенно. Полагаемся на явные invalidate'ы из мутаций
+ * (like/unlike/follow/playlist updates).
+ */
+const COLD_CACHE_MS = Number.POSITIVE_INFINITY;
 
 /* ── Helpers ───────────────────────────────────────────────────── */
 
@@ -198,6 +215,12 @@ function usePagedQuery<T>(opts: PagedQueryOptions<T>): PagedQueryResult<T> {
     gcTime: opts.gcTime ?? INFINITE_GC_MS,
     maxPages: opts.maxPages,
     enabled: opts.enabled,
+      // Списки рефрешатся только явными invalidate'ами из мутаций. Remount/
+      // reconnect не должен перетягивать весь infinite-query: для SC cursor-лент
+      // это перепроходит сдвинувшийся курсор и тасует выдачу. Focus-рефетч уже
+      // выключен глобально в query-client.
+      refetchOnMount: false,
+      refetchOnReconnect: false,
   });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: opts.autoFetchAll is stable, query is captured
@@ -273,27 +296,6 @@ export function useFeatured() {
   });
 }
 
-/* ── Feed ──────────────────────────────────────────────────────── */
-
-export function useFeed() {
-  const query = usePagedQuery<FeedItem>({
-    queryKey: ['feed'],
-    url: (page, limit) => pagedUrl('/me/feed', page, limit),
-    limit: 20,
-    staleTime: SHORT_CACHE_MS,
-    maxPages: 8,
-    dedupe: (item) => item.origin?.urn ?? `${item.type}:${item.created_at}`,
-  });
-
-  return {
-    items: query.items,
-    fetchNextPage: query.fetchNextPage,
-    hasNextPage: query.hasNextPage,
-    isFetchingNextPage: query.isFetchingNextPage,
-    isLoading: query.isLoading,
-  };
-}
-
 /* ── Liked tracks ──────────────────────────────────────────────── */
 
 export function useLikedTracks(limit = 30) {
@@ -301,7 +303,7 @@ export function useLikedTracks(limit = 30) {
     queryKey: ['me', 'likes', 'tracks', limit],
     url: (page, l) => pagedUrl('/me/likes/tracks', page, l),
     limit,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
   });
 
   const tracks = query.items;
@@ -409,8 +411,7 @@ export function usePostComment(trackUrn: string | undefined) {
 export function useRelatedTracks(trackUrn: string | undefined, limit = 10) {
   return useQuery({
     queryKey: ['track', trackUrn, 'related', limit],
-    queryFn: () =>
-      api<TrackPage>(`/tracks/${encodeURIComponent(trackUrn!)}/related?limit=${limit}&page=0`),
+      queryFn: () => fetchRelatedTracks(trackUrn!, limit),
     enabled: !!trackUrn,
     staleTime: SHORT_CACHE_MS,
     gcTime: INFINITE_GC_MS,
@@ -432,19 +433,19 @@ export function useTrackFavoriters(trackUrn: string | undefined, limit = 12) {
   });
 }
 
-/* ── Playlist Detail ──────────────────────────────────────────── */
+/* ── Playlist Detail (cold) ───────────────────────────────────── */
 
 export function usePlaylist(playlistUrn: string | undefined) {
   return useQuery({
     queryKey: ['playlist', playlistUrn],
     queryFn: () => api<Playlist>(`/playlists/${encodeURIComponent(playlistUrn!)}`),
     enabled: !!playlistUrn,
-    staleTime: MEDIUM_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     gcTime: INFINITE_GC_MS,
   });
 }
 
-/* ── Playlist Tracks ──────────────────────────────────────────── */
+/* ── Playlist Tracks (cold) ───────────────────────────────────── */
 
 export function usePlaylistTracks(playlistUrn: string | undefined) {
   const query = usePagedQuery<Track>({
@@ -452,7 +453,7 @@ export function usePlaylistTracks(playlistUrn: string | undefined) {
     url: (page, limit) =>
       pagedUrl(`/playlists/${encodeURIComponent(playlistUrn!)}/tracks`, page, limit),
     limit: 200,
-    staleTime: MEDIUM_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     enabled: !!playlistUrn,
     autoFetchAll: true,
   });
@@ -460,14 +461,14 @@ export function usePlaylistTracks(playlistUrn: string | undefined) {
   return { tracks: query.items, ...query };
 }
 
-/* ── User Profile ─────────────────────────────────────────────── */
+/* ── User Profile (cold) ──────────────────────────────────────── */
 
 export function useUser(userUrn: string | undefined) {
   return useQuery({
     queryKey: ['user', userUrn],
     queryFn: () => api<UserProfile>(`/users/${encodeURIComponent(userUrn!)}`),
     enabled: !!userUrn,
-    staleTime: MEDIUM_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     gcTime: INFINITE_GC_MS,
   });
 }
@@ -475,15 +476,9 @@ export function useUser(userUrn: string | undefined) {
 export function useUserTracks(userUrn: string | undefined) {
   const query = usePagedQuery<Track>({
     queryKey: ['user', userUrn, 'tracks'],
-    url: (page, limit) =>
-      pagedUrl(
-        `/users/${encodeURIComponent(userUrn!)}/tracks`,
-        page,
-        limit,
-        'access=playable,preview,blocked',
-      ),
+    url: (page, limit) => pagedUrl(`/users/${encodeURIComponent(userUrn!)}/tracks`, page, limit),
     limit: 30,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     maxPages: 8,
     enabled: !!userUrn,
     dedupe: (t) => t.urn,
@@ -497,15 +492,10 @@ export function useUserPopularTracks(userUrn: string | undefined) {
     queryKey: ['user', userUrn, 'tracks', 'popular'],
     queryFn: async () => {
       const all: Track[] = [];
-      const pageSize = 50;
+      const pageSize = 100;
       for (let page = 0; ; page++) {
         const data = await api<TrackPage>(
-          pagedUrl(
-            `/users/${encodeURIComponent(userUrn!)}/tracks`,
-            page,
-            pageSize,
-            'access=playable,preview,blocked',
-          ),
+          pagedUrl(`/users/${encodeURIComponent(userUrn!)}/tracks`, page, pageSize),
         );
         for (const t of data.collection) all.push(t);
         if (!data.has_more) break;
@@ -514,7 +504,7 @@ export function useUserPopularTracks(userUrn: string | undefined) {
       return all;
     },
     enabled: !!userUrn,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     gcTime: INFINITE_GC_MS,
   });
 }
@@ -524,7 +514,7 @@ export function useUserPlaylists(userUrn: string | undefined) {
     queryKey: ['user', userUrn, 'playlists'],
     url: (page, limit) => pagedUrl(`/users/${encodeURIComponent(userUrn!)}/playlists`, page, limit),
     limit: 30,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     maxPages: 8,
     enabled: !!userUrn,
     dedupe: (p) => p.urn,
@@ -537,14 +527,9 @@ export function useUserLikedTracks(userUrn: string | undefined) {
   const query = usePagedQuery<Track>({
     queryKey: ['user', userUrn, 'likes', 'tracks'],
     url: (page, limit) =>
-      pagedUrl(
-        `/users/${encodeURIComponent(userUrn!)}/likes/tracks`,
-        page,
-        limit,
-        'access=playable,preview,blocked',
-      ),
+      pagedUrl(`/users/${encodeURIComponent(userUrn!)}/likes/tracks`, page, limit),
     limit: 30,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     maxPages: 8,
     enabled: !!userUrn,
     dedupe: (t) => t.urn,
@@ -559,7 +544,7 @@ export function useUserFollowings(userUrn: string | undefined) {
     url: (page, limit) =>
       pagedUrl(`/users/${encodeURIComponent(userUrn!)}/followings`, page, limit),
     limit: 30,
-    staleTime: SHORT_CACHE_MS,
+    staleTime: COLD_CACHE_MS,
     maxPages: 8,
     enabled: !!userUrn,
     dedupe: (u) => u.urn,
@@ -568,6 +553,8 @@ export function useUserFollowings(userUrn: string | undefined) {
   return { users: query.items, ...query };
 }
 
+/* `/users/{urn}/followers` остался горячим на бэке (входящих подписчиков мы не
+ * храним как сущность) — короткий staleTime, как раньше. */
 export function useUserFollowers(userUrn: string | undefined) {
   const query = usePagedQuery<SCUser>({
     queryKey: ['user', userUrn, 'followers'],
@@ -603,13 +590,14 @@ export function useUserSubscription(userUrn: string | undefined) {
   });
 }
 
-/* ── My Library ────────────────────────────────────────────────── */
+/* ── My Library (cold) ─────────────────────────────────────────── */
 
 export function useMyFollowings(limit = 30) {
   const query = usePagedQuery<SCUser>({
     queryKey: ['me', 'followings', limit],
     url: (page, l) => pagedUrl('/me/followings', page, l),
     limit,
+    staleTime: COLD_CACHE_MS,
   });
 
   return { users: query.items, ...query };
@@ -620,6 +608,7 @@ export function useMyLikedPlaylists(limit = 30) {
     queryKey: ['me', 'likes', 'playlists', limit],
     url: (page, l) => pagedUrl('/me/likes/playlists', page, l),
     limit,
+    staleTime: COLD_CACHE_MS,
   });
 
   return { playlists: query.items, ...query };
@@ -630,6 +619,7 @@ export function useMyPlaylists(limit = 30) {
     queryKey: ['me', 'playlists', limit],
     url: (page, l) => pagedUrl('/me/playlists', page, l),
     limit,
+    staleTime: COLD_CACHE_MS,
   });
 
   return { playlists: query.items, ...query };
@@ -701,6 +691,48 @@ export function useCreatePlaylist() {
   });
 }
 
+/* ── Sharing (privacy) ─────────────────────────────────────────── */
+
+/** Тоггл приватности своего плейлиста. Optimistic: бэк сразу обновляет наш
+ *  `sharing` + кладёт write-back в SC через sync_queue. */
+export function useSetPlaylistSharing(playlistUrn: string | undefined) {
+    const qc = useQueryClient();
+    return useMutation({
+        mutationFn: (sharing: 'public' | 'private') =>
+            api(`/playlists/${encodeURIComponent(playlistUrn!)}/sharing`, {
+                method: 'PUT',
+                body: JSON.stringify({sharing}),
+            }),
+        onSuccess: (_data, sharing) => {
+            qc.setQueryData<Playlist>(['playlist', playlistUrn], (old) =>
+                old ? {...old, sharing} : old,
+            );
+            qc.invalidateQueries({queryKey: ['playlist', playlistUrn]});
+            qc.invalidateQueries({queryKey: ['me', 'playlists']});
+            // Список своих плейлистов на профиле — ['user', urn, 'playlists'].
+            qc.invalidateQueries({queryKey: ['user']});
+        },
+    });
+}
+
+/** Тоггл приватности своего трека. */
+export function useSetTrackSharing(trackUrn: string | undefined) {
+    const qc = useQueryClient();
+    return useMutation({
+        mutationFn: (sharing: 'public' | 'private') =>
+            api(`/tracks/${encodeURIComponent(trackUrn!)}/sharing`, {
+                method: 'PUT',
+                body: JSON.stringify({sharing}),
+            }),
+        onSuccess: (_data, sharing) => {
+            qc.setQueryData<Track>(['track', trackUrn], (old) => (old ? {...old, sharing} : old));
+            qc.invalidateQueries({queryKey: ['track', trackUrn], exact: true});
+            // Списки своих треков на профиле — ['user', urn, 'tracks'] (нет ['me','tracks']).
+            qc.invalidateQueries({queryKey: ['user']});
+        },
+    });
+}
+
 export function useDeletePlaylist() {
   const qc = useQueryClient();
   return useMutation({
@@ -756,6 +788,170 @@ export function useSearchUsers(q: string) {
   return { users: query.items, ...query };
 }
 
+/* ── Search: SCD-DB ───────────────────────────────────────────── */
+
+/**
+ * Поиск в нашей базе (зеркало SoundCloud). Возвращает только то, что мы уже
+ * индексировали — но без сетевого fan-out'а в SC API, поэтому в разы быстрее.
+ * Бэк зашит на trgm-индексы + statement_timeout, фронту достаточно поднести
+ * `q` и опционально `userUrn` для скоупа.
+ */
+
+const SEARCH_DB_LIMIT = 20;
+const SEARCH_DB_MAX_PAGES = 10;
+
+export function useSearchDbTracks(q: string, userUrn?: string) {
+  const query = usePagedQuery<Track>({
+    queryKey: ['search', 'db', 'tracks', q, userUrn ?? ''],
+    url: (page, limit) =>
+      pagedUrl(
+        '/search/db/tracks',
+        page,
+        limit,
+        `q=${encodeURIComponent(q)}${userUrn ? `&user_urn=${encodeURIComponent(userUrn)}` : ''}`,
+      ),
+    limit: SEARCH_DB_LIMIT,
+    staleTime: SEARCH_CACHE_MS,
+    maxPages: SEARCH_DB_MAX_PAGES,
+    enabled: !!q.trim(),
+    dedupe: (t) => t.urn,
+  });
+  return { tracks: query.items, ...query };
+}
+
+export function useSearchDbPlaylists(q: string, userUrn?: string) {
+  const query = usePagedQuery<Playlist>({
+    queryKey: ['search', 'db', 'playlists', q, userUrn ?? ''],
+    url: (page, limit) =>
+      pagedUrl(
+        '/search/db/playlists',
+        page,
+        limit,
+        `q=${encodeURIComponent(q)}${userUrn ? `&user_urn=${encodeURIComponent(userUrn)}` : ''}`,
+      ),
+    limit: SEARCH_DB_LIMIT,
+    staleTime: SEARCH_CACHE_MS,
+    maxPages: SEARCH_DB_MAX_PAGES,
+    enabled: !!q.trim(),
+    dedupe: (p) => p.urn,
+  });
+  return { playlists: query.items, ...query };
+}
+
+export function useSearchDbUsers(q: string) {
+  const query = usePagedQuery<SCUser>({
+    queryKey: ['search', 'db', 'users', q],
+    url: (page, limit) => pagedUrl('/search/db/users', page, limit, `q=${encodeURIComponent(q)}`),
+    limit: SEARCH_DB_LIMIT,
+    staleTime: SEARCH_CACHE_MS,
+    maxPages: SEARCH_DB_MAX_PAGES,
+    enabled: !!q.trim(),
+    dedupe: (u) => u.urn,
+  });
+  return { users: query.items, ...query };
+}
+
+export function useSearchDbArtists(q: string) {
+  const query = usePagedQuery<import('./discover').CatalogArtist>({
+    queryKey: ['search', 'db', 'artists', q],
+    url: (page, limit) => pagedUrl('/search/db/artists', page, limit, `q=${encodeURIComponent(q)}`),
+    limit: SEARCH_DB_LIMIT,
+    staleTime: SEARCH_CACHE_MS,
+    maxPages: SEARCH_DB_MAX_PAGES,
+    enabled: !!q.trim(),
+    dedupe: (a) => a.id,
+  });
+  return { artists: query.items, ...query };
+}
+
+export function useSearchDbAlbums(q: string) {
+  const query = usePagedQuery<import('./discover').CatalogAlbum>({
+    queryKey: ['search', 'db', 'albums', q],
+    url: (page, limit) => pagedUrl('/search/db/albums', page, limit, `q=${encodeURIComponent(q)}`),
+    limit: SEARCH_DB_LIMIT,
+    staleTime: SEARCH_CACHE_MS,
+    maxPages: SEARCH_DB_MAX_PAGES,
+    enabled: !!q.trim(),
+    dedupe: (a) => a.id,
+  });
+  return { albums: query.items, ...query };
+}
+
+/* ── Search: Vibe + Lyrics (AI) ───────────────────────────────── */
+
+const EMPTY_TRACKS: Track[] = [];
+const EMPTY_ATMOSPHERE: SearchAtmosphere = {topGenres: []};
+
+export interface SearchAtmosphere {
+    /** Dominant genres of the result set — used to tint the page atmosphere. */
+    topGenres: string[];
+}
+
+export interface VibeSearchResponse {
+    items: Track[];
+    atmosphere: SearchAtmosphere;
+    /** "preparing" = the query vector is still being computed by the worker
+     *  (high load); items is empty, the UI shows a "preparing vibe" plaque and
+     *  this query auto-refetches until it flips to "ready". */
+    status?: 'ready' | 'preparing';
+}
+
+/**
+ * Semantic "by vibe" search. Backend encodes the query (MuLan→CLAP, cached) and
+ * returns SC-shaped tracks in similarity order plus an `atmosphere` hint
+ * (dominant genres) the UI uses to recolour the page.
+ */
+export function useVibeSearch(q: string, opts?: { limit?: number; languages?: string[] }) {
+    const limit = opts?.limit ?? 48;
+    const langs = (opts?.languages ?? []).slice().sort().join(',');
+    const query = useQuery({
+        queryKey: ['search', 'vibe', q, limit, langs],
+        enabled: q.trim().length >= 2,
+        staleTime: SEARCH_CACHE_MS,
+        // While the worker is still encoding the query (preparing), poll until the
+        // vector lands and the backend flips to ready.
+        refetchInterval: (q2) => (q2.state.data?.status === 'preparing' ? 2500 : false),
+        queryFn: () => {
+            const usp = new URLSearchParams({q: q.trim(), limit: String(limit)});
+            if (langs) usp.set('languages', langs);
+            return api<VibeSearchResponse>(`/search/vibe?${usp}`, undefined, 30_000);
+        },
+    });
+    return {
+        tracks: query.data?.items ?? EMPTY_TRACKS,
+        atmosphere: query.data?.atmosphere ?? EMPTY_ATMOSPHERE,
+        preparing: query.data?.status === 'preparing',
+        ...query,
+    };
+}
+
+export type LyricMode = 'text' | 'semantic' | 'auto';
+
+export interface LyricHit {
+    track: Track;
+    /** The matched lyric line (text mode); null for pure semantic hits. */
+    matchedLine: string | null;
+    score: number;
+}
+
+/**
+ * Lyric search. `text` = keyword match over stored lyrics (returns the matched
+ * line); `semantic` = lyric-embedding similarity; `auto` = both, merged.
+ */
+export function useLyricSearch(q: string, mode: LyricMode = 'auto') {
+    const query = usePagedQuery<LyricHit>({
+        queryKey: ['search', 'lyrics', q, mode],
+        url: (page, limit) =>
+            pagedUrl('/search/lyrics', page, limit, `q=${encodeURIComponent(q)}&mode=${mode}`),
+        limit: SEARCH_DB_LIMIT,
+        staleTime: SEARCH_CACHE_MS,
+        maxPages: SEARCH_DB_MAX_PAGES,
+        enabled: q.trim().length >= 2,
+        dedupe: (h) => h.track.urn,
+    });
+    return {hits: query.items, ...query};
+}
+
 /* ── Fallback / Seed Tracks ────────────────────────────────────── */
 
 const FALLBACK_TRACK_IDS = '2028682452,2065341288,2028677636,2209249766,2060818444,2064016848';
@@ -807,9 +1003,8 @@ export function useRelatedPool(likedTracks: Track[]) {
     queryFn: async () => {
       const results = await Promise.all(
         seedUrns.map((urn) =>
-          api<TrackPage>(`/tracks/${encodeURIComponent(urn)}/related?limit=20&page=0`).catch(
-            () =>
-              ({ collection: [] as Track[], page: 0, page_size: 20, has_more: false }) as TrackPage,
+            fetchRelatedTracks(urn, 20).catch(
+                () => ({collection: [], page: 0, page_size: 20, has_more: false}) as TrackPage,
           ),
         ),
       );
@@ -879,6 +1074,19 @@ export function useDiscoverData(pool: RelatedPool | undefined, likedTracks: Trac
 
     return result;
   }, [pool, genreRanking]);
+}
+
+/**
+ * Общий related-pool фид: рекомендации + дискавери по жанрам, всё из лайков
+ * зрителя. Только данные (без рендера), чтобы полка «Recommended» на Home и
+ * призма Discover читали один источник, а не пересобирали пул каждая у себя.
+ */
+export function useDiscoverFeed() {
+    const {tracks: likedTracks} = useLikedTracks(100);
+    const {data: pool, isLoading} = useRelatedPool(likedTracks);
+    const recommended = useRecommendedTracks(pool, 40);
+    const byGenre = useDiscoverData(pool, likedTracks);
+    return {likedTracks, isLoading, recommended, byGenre};
 }
 
 /* ── Infinite scroll ───────────────────────────────────────────── */

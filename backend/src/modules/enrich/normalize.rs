@@ -13,6 +13,11 @@ static RE_NOISE: Lazy<Regex> = Lazy::new(|| {
 static RE_SPLIT_ARTISTS: Lazy<Regex> = Lazy::new(|| {
     Regex::new(r"(?i)\s+(?:x|×|vs\.?|&|and|,|feat\.?|ft\.?|featuring)\s+|,\s*").unwrap()
 });
+/// "03. Aikko - Title" — номер трека в начале artist-части. Срезаем форму с
+/// явной точкой после числа; голые цифры ловит `looks_like_track_number`.
+/// Не трогаем имена вида "M.O.S.T." (там нет ведущих цифр) или "112" /
+/// "21 Savage" (нет точки после числа).
+static RE_TRACK_NUM_PREFIX: Lazy<Regex> = Lazy::new(|| Regex::new(r"^\s*\d{1,3}\s*\.\s+").unwrap());
 
 /// Срезает префиксы-маркеры роли ("prod. by", "feat.", "remix by" и т.п.),
 /// которые могут просочиться в имя артиста из внешних источников (AI, Genius,
@@ -54,7 +59,106 @@ pub fn clean_artist_name(s: &str) -> String {
         }
         cur = stripped.trim().to_string();
     }
-    cur
+    strip_translit_parens(&cur)
+}
+
+/// Genius / MB иногда добавляют латинскую транслитерацию к нелатинскому
+/// имени в скобках в конце: "МОКЕРИ (moxckery)", "Зейн (zane)". Срезаем
+/// если outer содержит non-latin (>U+02AF), а внутри — только латиница.
+/// НЕ трогаем role-теги ("трек (cover)", "трек (remix)") и реальные
+/// альт-имена вида "Beyoncé (Sasha Fierce)" (обе стороны latin).
+pub fn strip_translit_parens(s: &str) -> String {
+    let trimmed = s.trim_end();
+    if !trimmed.ends_with(')') {
+        return s.to_string();
+    }
+    let Some(open) = trimmed.rfind('(') else {
+        return s.to_string();
+    };
+    let outer = trimmed[..open].trim_end();
+    let inner = &trimmed[open + 1..trimmed.len() - 1];
+    if outer.is_empty() || inner.is_empty() {
+        return s.to_string();
+    }
+    if looks_like_role_tag(inner) {
+        return s.to_string();
+    }
+    // Не-латиница: всё ВНЕ Basic Latin + Latin-1 + Latin Extended + IPA
+    // (≤ U+02AF). "Beyoncé" / "café" — latin-1 с диакритикой, не транслит,
+    // НЕ должны триггерить. Кириллица / греческий / CJK / арабский — да.
+    let outer_has_nonlatin = outer
+        .chars()
+        .any(|c| c.is_alphabetic() && (c as u32) > 0x02AF);
+    let inner_chars_ok = inner
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() || matches!(c, ' ' | '-' | '\'' | '.' | '`'));
+    let inner_has_letter = inner.chars().any(|c| c.is_ascii_alphabetic());
+    if outer_has_nonlatin && inner_chars_ok && inner_has_letter {
+        outer.to_string()
+    } else {
+        s.to_string()
+    }
+}
+
+/// Содержимое скобок — role/state тег → не трогаем (UI срежет на display
+/// после извлечения метаданных enrich-пайплайном).
+fn looks_like_role_tag(inner: &str) -> bool {
+    let lower = inner.trim().to_lowercase();
+    let head = lower.split_whitespace().next().unwrap_or("");
+    let tail = lower.split_whitespace().last().unwrap_or("");
+    matches!(
+        head,
+        "cover"
+            | "covers"
+            | "remix"
+            | "rmx"
+            | "edit"
+            | "version"
+            | "mix"
+            | "feat"
+            | "feat."
+            | "ft"
+            | "ft."
+            | "featuring"
+            | "prod"
+            | "prod."
+            | "produced"
+            | "with"
+            | "vs"
+            | "vs."
+            | "instrumental"
+            | "acoustic"
+            | "live"
+            | "demo"
+            | "bootleg"
+            | "flip"
+            | "mashup"
+            | "original"
+            | "extended"
+            | "radio"
+            | "free"
+            | "official"
+            | "premiere"
+            | "exclusive"
+            | "lyrics"
+            | "lyric"
+            | "visualizer"
+            | "hq"
+            | "hd"
+    ) || matches!(
+        tail,
+        "remix"
+            | "rmx"
+            | "edit"
+            | "mix"
+            | "version"
+            | "cover"
+            | "bootleg"
+            | "flip"
+            | "mashup"
+            | "instrumental"
+            | "acoustic"
+    )
 }
 
 pub fn normalize_name(s: &str) -> String {
@@ -98,7 +202,13 @@ pub struct ParsedTitle {
     pub producers: Vec<String>,
     pub remixers: Vec<String>,
     pub cleaned_title: String,
+    /// true → в title есть тег `(cover)` / `[cover]`. Resolver не делает
+    /// MB/Genius search (иначе подцепит оригинального исполнителя как primary
+    /// — а это кавер uploader'а, primary должен остаться = uploader).
+    pub is_cover: bool,
 }
+
+static RE_COVER: Lazy<Regex> = Lazy::new(|| Regex::new(r"(?i)^\s*cover(\s+version)?\s*$").unwrap());
 
 pub fn parse_sc_title(raw: &str, uploader: Option<&str>) -> ParsedTitle {
     let groups = extract_bracket_groups(raw);
@@ -108,7 +218,10 @@ pub fn parse_sc_title(raw: &str, uploader: Option<&str>) -> ParsedTitle {
     let (artist_part, title_part) = split_first_dash(&stripped);
     // Префикс вида "01 - …" / "1 - …" — это номер трека в альбоме, а не имя
     // артиста. Отбрасываем "артистную" часть, чтобы fallback ушёл на uploader.
-    let artist_part = artist_part.filter(|a| !looks_like_track_number(a));
+    // Также режем "03. Aikko" → "Aikko" (номер + точка перед реальным именем).
+    let artist_part = artist_part
+        .map(|a| RE_TRACK_NUM_PREFIX.replace(&a, "").trim().to_string())
+        .filter(|a| !a.is_empty() && !looks_like_track_number(a));
     let title_clean = title_part.trim().to_string();
     parsed.cleaned_title = if title_clean.is_empty() {
         stripped.trim().to_string()
@@ -128,6 +241,10 @@ pub fn parse_sc_title(raw: &str, uploader: Option<&str>) -> ParsedTitle {
     for g in groups {
         let g = g.trim();
         if g.is_empty() {
+            continue;
+        }
+        if RE_COVER.is_match(g) {
+            parsed.is_cover = true;
             continue;
         }
         if RE_NOISE.is_match(g) {
@@ -462,6 +579,76 @@ mod tests {
         let p = parse_sc_title("112 - Peaches & Cream", None);
         assert_eq!(p.primary_artists, vec!["112"]);
         assert_eq!(p.cleaned_title, "Peaches & Cream");
+    }
+
+    #[test]
+    fn parse_track_number_dot_prefix_in_artist_part() {
+        // Реальный кейс: трек "03. Aikko - Мне Выгодней Вас Не Знать" — uploader
+        // лил альбом и в title зашит номер трека + имя артиста через точку.
+        // Должны срезать "03. " и оставить artist = "Aikko".
+        let p = parse_sc_title(
+            "03. Aikko - Мне Выгодней Вас Не Знать",
+            Some("Thirteenth :3"),
+        );
+        assert_eq!(p.primary_artists, vec!["Aikko"]);
+        assert_eq!(p.cleaned_title, "Мне Выгодней Вас Не Знать");
+
+        // После среза остался голый номер — fallback на uploader.
+        let p = parse_sc_title("03. 04 - Title", Some("uploader"));
+        assert_eq!(p.primary_artists, vec!["uploader"]);
+
+        // "M.O.S.T." — нет ведущих цифр, не трогаем.
+        let p = parse_sc_title("M.O.S.T. - Track", None);
+        assert_eq!(p.primary_artists, vec!["M.O.S.T."]);
+    }
+
+    #[test]
+    fn strip_translit_basic() {
+        assert_eq!(clean_artist_name("МОКЕРИ (moxckery)"), "МОКЕРИ");
+        assert_eq!(clean_artist_name("Зейн (zane)"), "Зейн");
+        assert_eq!(clean_artist_name("МОКЕРИ"), "МОКЕРИ");
+        // Beyoncé (Sasha Fierce) — оба содержат latin, не транслит → оставляем
+        assert_eq!(
+            clean_artist_name("Beyoncé (Sasha Fierce)"),
+            "Beyoncé (Sasha Fierce)"
+        );
+        // Только латиница в outer → не трогаем (артист «X (the band)»)
+        assert_eq!(clean_artist_name("X (the band)"), "X (the band)");
+        // Внутри скобок что-то нелатинское → не транслит → оставляем
+        assert_eq!(clean_artist_name("Eminem (Эминем)"), "Eminem (Эминем)");
+        // Транслит с пробелом / дефисом — срезаем
+        assert_eq!(
+            clean_artist_name("Чёрный обелиск (cherny obelisk)"),
+            "Чёрный обелиск"
+        );
+    }
+
+    #[test]
+    fn strip_translit_keeps_role_tags() {
+        // Role-теги в скобках НЕ трогаем — даже если outer non-latin,
+        // а inner чисто латиница (cover/remix/feat/prod/...). Они смысловые,
+        // UI-display их срежет; здесь сохраняем чтобы в БД хранился оригинал
+        // для последующей обработки enrich-пайплайном.
+        assert_eq!(strip_translit_parens("tainted (cover)"), "tainted (cover)");
+        assert_eq!(strip_translit_parens("трек (cover)"), "трек (cover)");
+        assert_eq!(
+            strip_translit_parens("трек (Cover Version)"),
+            "трек (Cover Version)"
+        );
+        assert_eq!(strip_translit_parens("трек (remix)"), "трек (remix)");
+        assert_eq!(
+            strip_translit_parens("трек (someone remix)"),
+            "трек (someone remix)"
+        );
+        assert_eq!(strip_translit_parens("трек (feat. X)"), "трек (feat. X)");
+        assert_eq!(strip_translit_parens("трек (prod. X)"), "трек (prod. X)");
+        assert_eq!(
+            strip_translit_parens("трек (instrumental)"),
+            "трек (instrumental)"
+        );
+        assert_eq!(strip_translit_parens("трек (live)"), "трек (live)");
+        // А вот translit без role-тега — срезаем (имя в скобках, не роль)
+        assert_eq!(strip_translit_parens("трек (translit)"), "трек");
     }
 
     #[test]

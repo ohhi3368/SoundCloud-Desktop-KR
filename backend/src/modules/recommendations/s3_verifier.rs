@@ -30,6 +30,34 @@ impl S3VerifierService {
         })
     }
 
+    /// True если файл `sc_track_id` подтверждён в S3 (через свежий
+    /// `s3_verified_at` или live HEAD). False если миссинг или storage_url
+    /// не сконфигурирован (последнее — fail-open: пусть стриминг
+    /// доделает работу).
+    pub async fn is_present(&self, sc_track_id: &str) -> bool {
+        if self.storage_url.is_empty() {
+            return false;
+        }
+        let ids = vec![sc_track_id.to_string()];
+        match self.find_missing(&ids).await {
+            Ok(missing) => !missing.contains(sc_track_id),
+            Err(e) => {
+                debug!(track = %sc_track_id, error = %e, "S3 verify failed; assuming missing");
+                false
+            }
+        }
+    }
+
+    /// URL вида `{storage}/redirect/soundcloud_tracks_{id}.m4a` — стабильный
+    /// download-link для воркеров; совпадает с тем, что storage публикует в
+    /// `storage.track_uploaded`.
+    pub fn redirect_url_for(&self, sc_track_id: &str) -> String {
+        format!(
+            "{}/redirect/soundcloud_tracks_{sc_track_id}.m4a",
+            self.storage_url
+        )
+    }
+
     pub async fn find_missing(&self, sc_track_ids: &[String]) -> AppResult<HashSet<String>> {
         let mut missing: HashSet<String> = HashSet::new();
         if sc_track_ids.is_empty() || self.storage_url.is_empty() {
@@ -38,17 +66,17 @@ impl S3VerifierService {
 
         let ttl_cutoff = Utc::now() - chrono::Duration::from_std(MISS_TTL).unwrap();
 
-        let rows: Vec<(String, Option<DateTime<Utc>>, Option<DateTime<Utc>>)> = sqlx::query_as(
-            "SELECT sc_track_id, s3_verified_at, s3_missing_at FROM indexed_tracks \
+        type VerifyRow = (String, Option<DateTime<Utc>>, Option<DateTime<Utc>>);
+        type VerifyMap =
+            std::collections::HashMap<String, (Option<DateTime<Utc>>, Option<DateTime<Utc>>)>;
+        let rows: Vec<VerifyRow> = sqlx::query_as(
+            "SELECT sc_track_id, s3_verified_at, s3_missing_at FROM tracks \
              WHERE sc_track_id = ANY($1)",
         )
         .bind(sc_track_ids)
         .fetch_all(&self.pg)
         .await?;
-        let mut by_id: std::collections::HashMap<
-            String,
-            (Option<DateTime<Utc>>, Option<DateTime<Utc>>),
-        > = std::collections::HashMap::new();
+        let mut by_id: VerifyMap = std::collections::HashMap::new();
         for (id, v, m) in rows {
             by_id.insert(id, (v, m));
         }
@@ -94,7 +122,10 @@ impl S3VerifierService {
 
         if !ok_ids.is_empty() {
             sqlx::query(
-                "UPDATE indexed_tracks SET s3_verified_at = now(), s3_missing_at = NULL \
+                "UPDATE tracks SET \
+                     storage_state = 'ok', \
+                     s3_verified_at = now(), \
+                     s3_missing_at = NULL \
                  WHERE sc_track_id = ANY($1)",
             )
             .bind(&ok_ids)
@@ -103,7 +134,13 @@ impl S3VerifierService {
         }
         if !miss_ids.is_empty() {
             sqlx::query(
-                "UPDATE indexed_tracks SET s3_missing_at = now() WHERE sc_track_id = ANY($1)",
+                "UPDATE tracks SET \
+                     storage_state = CASE \
+                         WHEN storage_state = 'pending' THEN 'pending' \
+                         ELSE 'missing' \
+                     END, \
+                     s3_missing_at = now() \
+                 WHERE sc_track_id = ANY($1)",
             )
             .bind(&miss_ids)
             .execute(&self.pg)

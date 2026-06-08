@@ -15,9 +15,8 @@ use crate::state::AppState;
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/me", get(get_profile))
+        .route("/me/cold", get(get_profile_cold))
         .route("/me/subscription", get(get_subscription))
-        .route("/me/feed", get(get_feed))
-        .route("/me/feed/tracks", get(get_feed_tracks))
         .route("/me/likes/tracks", get(get_liked_tracks))
         .route("/me/likes/playlists", get(get_liked_playlists))
         .route("/me/followings", get(get_followings))
@@ -35,48 +34,17 @@ async fn get_profile(State(st): State<AppState>, ctx: SessionCtx) -> AppResult<J
     Ok(Json(st.me.get_profile(&ctx.access_token).await?))
 }
 
-async fn get_subscription(State(st): State<AppState>, ctx: SessionCtx) -> AppResult<Json<Value>> {
-    let premium = st.subscriptions.is_premium(&ctx.sc_user_id).await?;
-    Ok(Json(premium_response(premium)))
-}
-
-async fn get_feed(
-    State(st): State<AppState>,
-    ctx: SessionCtx,
-    Query(q): Query<PaginationQuery>,
-) -> AppResult<Json<ListPageResult<Value>>> {
-    let (page, limit) = q.resolved();
+async fn get_profile_cold(State(st): State<AppState>, ctx: SessionCtx) -> AppResult<Json<Value>> {
     Ok(Json(
         st.me
-            .get_feed(
-                &ctx.access_token,
-                &ctx.session_id.to_string(),
-                &ctx.sc_user_id,
-                page,
-                limit,
-            )
+            .get_profile_cold(&ctx.sc_user_id, &ctx.access_token)
             .await?,
     ))
 }
 
-async fn get_feed_tracks(
-    State(st): State<AppState>,
-    ctx: SessionCtx,
-    Query(q): Query<PaginationQuery>,
-) -> AppResult<Json<ListPageResult<Value>>> {
-    let (page, limit) = q.resolved();
-    let mut result = st
-        .me
-        .get_feed_tracks(
-            &ctx.access_token,
-            &ctx.session_id.to_string(),
-            &ctx.sc_user_id,
-            page,
-            limit,
-        )
-        .await?;
-    enrich_dto::apply_to_tracks(&st.pg, &mut result.collection).await?;
-    Ok(Json(result))
+async fn get_subscription(State(st): State<AppState>, ctx: SessionCtx) -> AppResult<Json<Value>> {
+    let premium = st.subscriptions.is_premium(&ctx.sc_user_id).await?;
+    Ok(Json(premium_response(premium)))
 }
 
 async fn get_liked_tracks(
@@ -90,8 +58,15 @@ async fn get_liked_tracks(
         .access
         .unwrap_or_else(|| "playable,preview,blocked".into());
     let mut result = st
-        .me
-        .get_liked_tracks(&ctx.access_token, &ctx.sc_user_id, page, limit, &access)
+        .users
+        .get_liked_tracks(
+            ctx.session_id,
+            &ctx.sc_user_id,
+            &ctx.sc_user_id,
+            page,
+            limit,
+            &access,
+        )
         .await?;
     enrich_dto::apply_to_tracks(&st.pg, &mut result.collection).await?;
     Ok(Json(result))
@@ -104,8 +79,14 @@ async fn get_liked_playlists(
 ) -> AppResult<Json<ListPageResult<Value>>> {
     let (page, limit) = q.resolved();
     Ok(Json(
-        st.me
-            .get_liked_playlists(&ctx.access_token, &ctx.sc_user_id, page, limit)
+        st.users
+            .get_liked_playlists(
+                ctx.session_id,
+                &ctx.sc_user_id,
+                &ctx.sc_user_id,
+                page,
+                limit,
+            )
             .await?,
     ))
 }
@@ -117,8 +98,14 @@ async fn get_followings(
 ) -> AppResult<Json<ListPageResult<Value>>> {
     let (page, limit) = q.resolved();
     Ok(Json(
-        st.me
-            .get_followings(&ctx.access_token, &ctx.sc_user_id, page, limit)
+        st.users
+            .get_followings(
+                ctx.session_id,
+                &ctx.sc_user_id,
+                &ctx.sc_user_id,
+                page,
+                limit,
+            )
             .await?,
     ))
 }
@@ -196,8 +183,14 @@ async fn get_playlists(
 ) -> AppResult<Json<ListPageResult<Value>>> {
     let (page, limit) = q.resolved();
     Ok(Json(
-        st.me
-            .get_playlists(&ctx.access_token, &ctx.sc_user_id, page, limit)
+        st.users
+            .get_owned_playlists(
+                ctx.session_id,
+                &ctx.sc_user_id,
+                &ctx.sc_user_id,
+                page,
+                limit,
+            )
             .await?,
     ))
 }
@@ -209,8 +202,14 @@ async fn get_tracks(
 ) -> AppResult<Json<ListPageResult<Value>>> {
     let (page, limit) = q.resolved();
     let mut result = st
-        .me
-        .get_tracks(&ctx.access_token, &ctx.sc_user_id, page, limit)
+        .users
+        .get_owned_tracks(
+            ctx.session_id,
+            &ctx.sc_user_id,
+            &ctx.sc_user_id,
+            page,
+            limit,
+        )
         .await?;
     enrich_dto::apply_to_tracks(&st.pg, &mut result.collection).await?;
     Ok(Json(result))

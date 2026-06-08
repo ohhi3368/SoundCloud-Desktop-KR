@@ -26,17 +26,22 @@ pub struct ListPageResult<T> {
     pub has_more: bool,
 }
 
+/// Результат одного chunk-fetch'а. `next_href` — абсолютный URL следующей
+/// страницы, как SC отдал в response.next_href. Передаётся обратно в fetcher
+/// для следующего chunk'а как есть, без переразбора query (это ломало
+/// `/playlists/{id}/tracks` — SC ждёт `offset=`, реконструкция клала `cursor=`
+/// и страница циклилась на первых 200 треках).
 #[derive(Debug, Clone)]
 pub struct FetchChunkResult<T> {
     pub items: Vec<T>,
-    pub next_cursor: Option<String>,
+    pub next_href: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ListState<T> {
     items: Vec<T>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    next_cursor: Option<String>,
+    next_href: Option<String>,
     exhausted: bool,
 }
 
@@ -44,7 +49,7 @@ impl<T> Default for ListState<T> {
     fn default() -> Self {
         Self {
             items: Vec::new(),
-            next_cursor: None,
+            next_href: None,
             exhausted: false,
         }
     }
@@ -81,6 +86,36 @@ impl ListCacheService {
             CacheScope::User => format!("user:{}:{key}", session_id.unwrap_or("")),
             CacheScope::Shared => format!("shared:{key}"),
         }
+    }
+
+    /// Set, в котором лежат все конкретные list-ключи данного префикса —
+    /// заменяет full-keyspace SCAN при инвалидации точечным SMEMBERS+DEL.
+    fn index_key(prefix: &str, scope: CacheScope, session_id: Option<&str>) -> String {
+        format!(
+            "idx:{LIST_PREFIX}{}",
+            Self::build_redis_key(prefix, scope, session_id)
+        )
+    }
+
+    /// Регистрирует сохранённый list-ключ в index-set его префикса (TTL чуть
+    /// больше, чем у записей, чтобы set их переживал).
+    async fn register_prefix_index(
+        &self,
+        redis_key: &str,
+        cache_key: &str,
+        scope: CacheScope,
+        session_id: Option<&str>,
+        ttl_sec: u64,
+    ) {
+        let prefix = cache_key.split(':').next().unwrap_or(cache_key);
+        let idx = Self::index_key(prefix, scope, session_id);
+        let full = format!("{LIST_PREFIX}{redis_key}");
+        let mut conn = match self.redis.get().await {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let _: Result<(), _> = conn.sadd(&idx, &full).await;
+        let _: Result<(), _> = conn.expire(&idx, (ttl_sec as i64) + 60).await;
     }
 
     fn lock(&self, key: &str) -> Arc<AsyncMutex<()>> {
@@ -153,38 +188,19 @@ impl ListCacheService {
             return Ok(());
         }
         let mut conn = self.redis.get().await?;
-        let mut patterns: Vec<String> = Vec::new();
+        let mut index_keys: Vec<String> = Vec::new();
         for p in prefixes {
-            patterns.push(format!(
-                "{LIST_PREFIX}{}*",
-                Self::build_redis_key(p, CacheScope::Shared, None)
-            ));
+            index_keys.push(Self::index_key(p, CacheScope::Shared, None));
             if session_id.is_some() {
-                patterns.push(format!(
-                    "{LIST_PREFIX}{}*",
-                    Self::build_redis_key(p, CacheScope::User, session_id)
-                ));
+                index_keys.push(Self::index_key(p, CacheScope::User, session_id));
             }
         }
-        for pattern in patterns {
-            let mut cursor: u64 = 0;
-            loop {
-                let (next, keys): (u64, Vec<String>) = deadpool_redis::redis::cmd("SCAN")
-                    .arg(cursor)
-                    .arg("MATCH")
-                    .arg(&pattern)
-                    .arg("COUNT")
-                    .arg(200)
-                    .query_async(&mut conn)
-                    .await?;
-                if !keys.is_empty() {
-                    let _: () = conn.del(keys).await?;
-                }
-                if next == 0 {
-                    break;
-                }
-                cursor = next;
+        for idx in index_keys {
+            let members: Vec<String> = conn.smembers(&idx).await.unwrap_or_default();
+            if !members.is_empty() {
+                let _: () = conn.del(members).await?;
             }
+            let _: () = conn.del(&idx).await?;
         }
         Ok(())
     }
@@ -252,16 +268,24 @@ impl ListCacheService {
 
         let mut chunks = 0usize;
         while state.items.len() < need && !state.exhausted && chunks < MAX_CHUNKS_PER_REQUEST {
-            let fetched = fetcher(state.next_cursor.clone(), chunk_size).await?;
+            let fetched = fetcher(state.next_href.clone(), chunk_size).await?;
             let items_len = fetched.items.len();
             state.items.extend(fetched.items);
-            state.next_cursor = fetched.next_cursor;
-            state.exhausted = state.next_cursor.is_none() || items_len == 0;
+            state.next_href = fetched.next_href;
+            state.exhausted = state.next_href.is_none() || items_len == 0;
             chunks += 1;
         }
 
         if chunks > 0 {
             self.save(&redis_key, &state, opts.ttl_sec).await;
+            self.register_prefix_index(
+                &redis_key,
+                opts.key,
+                opts.scope,
+                opts.session_id,
+                opts.ttl_sec,
+            )
+                .await;
         }
 
         Ok(slice_page(state, opts.page, opts.limit))
@@ -284,17 +308,6 @@ fn slice_page<T: Clone>(state: ListState<T>, page: i64, limit: i64) -> ListPageR
         page_size: limit,
         has_more,
     }
-}
-
-pub fn extract_sc_cursor(next_href: Option<&str>) -> Option<String> {
-    let href = next_href?;
-    let url = url::Url::parse(href).ok()?;
-    for (k, v) in url.query_pairs() {
-        if k == "cursor" || k == "offset" {
-            return Some(v.into_owned());
-        }
-    }
-    None
 }
 
 pub fn build_list_cache_key(prefix: &str, params: &[(&str, String)]) -> String {

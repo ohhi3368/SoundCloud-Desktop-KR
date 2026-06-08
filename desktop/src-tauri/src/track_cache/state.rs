@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as _;
 use std::path::Path;
 use std::path::PathBuf;
@@ -16,6 +16,7 @@ use tokio::sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore};
 use crate::app::diagnostics::log_native;
 use crate::track_cache::direct_download::try_download;
 use crate::track_cache::sc_anon::AnonClient;
+use crate::track_cache::transcode;
 
 const MIN_AUDIO_SIZE: u64 = 8192;
 const AUDIO_SNIFF_LEN: usize = 16;
@@ -30,7 +31,26 @@ const DIRECT_READ_TIMEOUT_SECS: u64 = 70;
 const RETRY_DELAYS_MS: [u64; 3] = [200, 600, 1500];
 const MAX_PARALLEL_PRELOADS: usize = 20;
 const MAX_PARALLEL_LIKES: usize = 4;
+/// Transcoding is CPU-bound; keep it modest so it never starves playback on weak
+/// machines. Most cached tracks are already AAC (a near-free remux), so a small
+/// pool drains the queue fast in practice.
+const MAX_PARALLEL_TRANSCODES: usize = 2;
 const CACHE_METADATA_EXT: &str = ".meta.json";
+/// Cover art fetched for download-to-file export is capped to avoid pathological
+/// payloads sneaking into the muxer.
+const MAX_COVER_BYTES: u64 = 8 * 1024 * 1024;
+/// Duration drift allowed between a cached file and the API-reported length
+/// before the cache entry is treated as a truncated (interrupted) download.
+const DURATION_TOLERANCE_MS: u64 = 4000;
+const DURATION_TOLERANCE_FRAC: f64 = 0.04;
+/// How many times a track may transcode "too short" before we accept that the
+/// source only offers a preview and stop re-fetching it (prevents a download loop
+/// for tracks whose API length is full but whose only stream is a 30s snippet).
+const MAX_TRUNCATED_RETRIES: u8 = 2;
+/// Grace before deleting the raw А file after its clean Б is committed. A path
+/// handed to the player is read in a separate command a few ms later; this keeps
+/// that file alive across the gap so playback never reads a just-deleted file.
+const INCOMING_GRACE_SECS: u64 = 30;
 
 /// Magic-byte validation for audio files
 fn is_valid_audio(prefix: &[u8], total_size: u64) -> bool {
@@ -95,6 +115,32 @@ fn filename_to_urn(filename: &str) -> Option<String> {
 
 fn is_audio_cache_file(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("audio")
+}
+
+fn is_valid_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.len() >= MIN_AUDIO_SIZE)
+        .unwrap_or(false)
+}
+
+/// Whether a cached file's length is acceptable against the API-reported length.
+/// Deliberately one-sided: only a file *shorter* than expected signals a
+/// truncated/interrupted download. A *longer* file means the API length was an
+/// underestimate — most importantly a Go+ 30s preview length for a track whose
+/// full audio we actually cached — so it is kept. A symmetric check would flag
+/// those as corrupt and re-download them forever.
+fn cached_duration_ok(actual: u64, expected: u64) -> bool {
+    let tol = DURATION_TOLERANCE_MS.max((expected as f64 * DURATION_TOLERANCE_FRAC) as u64);
+    actual + tol >= expected
+}
+
+/// A clean file is trustworthy unless its probed length is recorded and falls
+/// short of the recorded API length (a truncated download committed pre-crash).
+fn meta_duration_ok(meta: Option<&TrackCacheMetadata>) -> bool {
+    match meta.and_then(|m| m.duration_ms.zip(m.expected_duration_ms)) {
+        Some((actual, expected)) => cached_duration_ok(actual, expected),
+        None => true,
+    }
 }
 
 fn cache_metadata_path(path: &Path) -> PathBuf {
@@ -247,6 +293,16 @@ struct TrackCacheMetadata {
     quality: PlaybackQuality,
     #[serde(default)]
     source: Option<DownloadSource>,
+    /// Whether the transcoded output belongs in the protected `liked_dir`.
+    /// Recorded on the raw incoming file so startup recovery routes it correctly.
+    #[serde(default)]
+    liked: bool,
+    /// API-reported track length (ms), used to detect truncated downloads.
+    #[serde(default)]
+    expected_duration_ms: Option<u64>,
+    /// Probed length (ms) of the committed clean file.
+    #[serde(default)]
+    duration_ms: Option<u64>,
 }
 
 #[derive(Clone, serde::Serialize)]
@@ -264,6 +320,22 @@ impl TrackCacheEntry {
             source: meta.and_then(|m| m.source.map(|s| s.label().to_string())),
         }
     }
+}
+
+/// Live snapshot of the А→Б transcode pipeline for the Settings UI.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TranscodeStatus {
+    /// "ready" | "preparing" | "unavailable".
+    pub ffmpeg: &'static str,
+    /// Raw files staged in А.
+    pub incoming: u32,
+    pub incoming_bytes: u64,
+    /// Transcodes in flight right now.
+    pub transcoding: u32,
+    /// Clean m4a files in Б (audio + liked).
+    pub clean: u32,
+    pub clean_bytes: u64,
 }
 
 enum DownloadError {
@@ -288,6 +360,8 @@ pub struct LikeCacheEntry {
     pub session_id: Option<String>,
     #[serde(default)]
     pub hq: bool,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
 }
 
 pub struct CacheRequest<'a> {
@@ -298,6 +372,9 @@ pub struct CacheRequest<'a> {
     pub session_id: Option<&'a str>,
     pub hq: bool,
     pub liked: bool,
+    /// API-reported track length (ms), if known — enables truncated-download
+    /// detection. `None` falls back to the size + magic-byte gate only.
+    pub expected_duration_ms: Option<u64>,
 }
 
 struct FallbackParams<'a> {
@@ -334,18 +411,25 @@ fn make_redirect_url(storage_url: &str) -> Option<String> {
     Some(parsed.to_string())
 }
 
-fn dir_size(dir: &Path) -> u64 {
+/// Count and total bytes of cached audio files in a dir.
+fn dir_stats(dir: &Path) -> (u32, u64) {
+    let mut count = 0u32;
     let mut total = 0u64;
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             if let Ok(meta) = entry.metadata() {
                 if meta.is_file() && is_audio_cache_file(&entry.path()) {
+                    count += 1;
                     total += meta.len();
                 }
             }
         }
     }
-    total
+    (count, total)
+}
+
+fn dir_size(dir: &Path) -> u64 {
+    dir_stats(dir).1
 }
 
 fn clear_audio_dir(dir: &Path) {
@@ -388,17 +472,73 @@ fn collect_cached_urns(
     }
 }
 
+/// Remove abandoned temp files from interrupted writes/transcodes: `.part`
+/// (audio/transcode renders) and `.meta.json.tmp` (metadata renders). Only call
+/// when no writer is active (startup, before the webview issues downloads).
+fn sweep_temp_files(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.contains(".part") || name.ends_with(".tmp") {
+            std::fs::remove_file(entry.path()).ok();
+        }
+    }
+}
+
+/// Valid raw URNs awaiting transcode; drops undersized stragglers in passing.
+fn list_incoming_urns(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !is_audio_cache_file(&path) {
+            continue;
+        }
+        let Some(urn) = filename_to_urn(&entry.file_name().to_string_lossy()) else {
+            continue;
+        };
+        if is_valid_file(&path) {
+            out.push(urn);
+        } else {
+            std::fs::remove_file(&path).ok();
+            remove_cache_metadata(&path);
+        }
+    }
+    out
+}
+
 #[derive(Clone)]
 pub struct TrackCacheState {
     pub audio_dir: PathBuf,
     pub liked_dir: PathBuf,
+    /// Staging area (folder "А") for freshly downloaded raw bytes awaiting
+    /// transcode into the clean m4a caches (`audio_dir` / `liked_dir` = folder "Б").
+    pub incoming_dir: PathBuf,
     pub client: Client,
     pub storage_client: Client,
     pub direct_client: Client,
     pub app_handle: Option<tauri::AppHandle>,
+    /// Managed ffmpeg binary, populated asynchronously at startup (system PATH
+    /// or download). Shared so the background acquire is visible to all clones.
+    /// `None` disables transcoding (cache then serves raw bytes from `incoming_dir`).
+    ffmpeg: Arc<StdMutex<Option<PathBuf>>>,
+    /// Set once the startup ffmpeg acquisition finishes (success or not), so the
+    /// UI can distinguish "still preparing" from "gave up / unavailable".
+    ffmpeg_probe_done: Arc<std::sync::atomic::AtomicBool>,
     active: Arc<Mutex<HashMap<String, ActiveDownload>>>,
     preload_limiter: Arc<Semaphore>,
     likes_limiter: Arc<Semaphore>,
+    transcode_limiter: Arc<Semaphore>,
+    /// URNs with a transcode in flight, so live + recovery requests coalesce.
+    transcoding: Arc<StdMutex<HashSet<String>>>,
+    /// Per-URN count of consecutive "transcoded too short" results, to cap
+    /// re-downloads of preview-only tracks (best-effort, per session).
+    truncated_retries: Arc<StdMutex<HashMap<String, u8>>>,
     likes_running: Arc<std::sync::atomic::AtomicBool>,
     likes_cancel: Arc<std::sync::atomic::AtomicBool>,
     /// Per-host storage circuit breaker: host -> epoch secs of last failure.
@@ -406,7 +546,14 @@ pub struct TrackCacheState {
     anon: Arc<AnonClient>,
 }
 
-pub fn init(audio_dir: PathBuf, liked_dir: PathBuf) -> TrackCacheState {
+pub fn init(audio_dir: PathBuf, liked_dir: PathBuf, incoming_dir: PathBuf) -> TrackCacheState {
+    // Sweep temps left by an interrupted previous run. Safe here: init() runs
+    // during setup, before the webview can issue any download, so nothing the
+    // sweep matches is live.
+    for dir in [&incoming_dir, &audio_dir, &liked_dir] {
+        sweep_temp_files(dir);
+    }
+
     let client = Client::builder()
         .redirect(reqwest::redirect::Policy::limited(10))
         .tcp_nodelay(true)
@@ -449,13 +596,19 @@ pub fn init(audio_dir: PathBuf, liked_dir: PathBuf) -> TrackCacheState {
     TrackCacheState {
         audio_dir,
         liked_dir,
+        incoming_dir,
         client,
         storage_client,
         direct_client,
         app_handle: None,
+        ffmpeg: Arc::new(StdMutex::new(None)),
+        ffmpeg_probe_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         active: Arc::new(Mutex::new(HashMap::new())),
         preload_limiter: Arc::new(Semaphore::new(MAX_PARALLEL_PRELOADS)),
         likes_limiter: Arc::new(Semaphore::new(MAX_PARALLEL_LIKES)),
+        transcode_limiter: Arc::new(Semaphore::new(MAX_PARALLEL_TRANSCODES)),
+        transcoding: Arc::new(StdMutex::new(HashSet::new())),
+        truncated_retries: Arc::new(StdMutex::new(HashMap::new())),
         likes_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         likes_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         storage_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
@@ -464,7 +617,7 @@ pub fn init(audio_dir: PathBuf, liked_dir: PathBuf) -> TrackCacheState {
 }
 
 fn quality_from_url(url: &str) -> PlaybackQuality {
-    Url::parse(url)
+    if Url::parse(url)
         .ok()
         .map(|parsed| {
             parsed
@@ -472,8 +625,11 @@ fn quality_from_url(url: &str) -> PlaybackQuality {
                 .any(|(key, value)| key == "hq" && value == "true")
         })
         .unwrap_or(false)
-        .then_some(PlaybackQuality::Hq)
-        .unwrap_or(PlaybackQuality::Sq)
+    {
+        PlaybackQuality::Hq
+    } else {
+        PlaybackQuality::Sq
+    }
 }
 
 fn temp_file_path(target_dir: &Path, urn: &str) -> PathBuf {
@@ -580,6 +736,9 @@ async fn write_response_to_cache(
     let cache_meta = TrackCacheMetadata {
         quality,
         source: Some(source),
+        liked: false,
+        expected_duration_ms: None,
+        duration_ms: None,
     };
 
     if let Ok(meta) = tokio::fs::metadata(&final_path).await {
@@ -655,6 +814,9 @@ async fn write_bytes_to_cache(
     let cache_meta = TrackCacheMetadata {
         quality,
         source: Some(source),
+        liked: false,
+        expected_duration_ms: None,
+        duration_ms: None,
     };
 
     if let Ok(meta) = tokio::fs::metadata(&final_path).await {
@@ -761,6 +923,66 @@ impl TrackCacheState {
         }
     }
 
+    /// Current ffmpeg path, or `None` while it is still being acquired / when
+    /// acquisition failed (transcoding disabled, raw bytes served instead).
+    fn ffmpeg(&self) -> Option<PathBuf> {
+        self.ffmpeg.lock().ok().and_then(|g| g.clone())
+    }
+
+    /// Acquire ffmpeg (system PATH or download into `install_dir`) and publish it
+    /// to all clones. Run once in the background at startup, before recovery.
+    pub async fn init_ffmpeg(&self, install_dir: PathBuf) {
+        match transcode::acquire_ffmpeg(&install_dir).await {
+            Some(path) => {
+                let line = format!("[TrackCache] ffmpeg ready: {}", path.display());
+                println!("{line}");
+                self.diag("INFO", line);
+                if let Ok(mut slot) = self.ffmpeg.lock() {
+                    *slot = Some(path);
+                }
+            }
+            None => {
+                let line =
+                    "[TrackCache] ffmpeg unavailable — transcoding disabled, serving raw audio"
+                        .to_string();
+                eprintln!("{line}");
+                self.diag("WARN", line);
+            }
+        }
+        self.ffmpeg_probe_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Live snapshot of the А→Б pipeline for the Settings UI.
+    pub fn transcode_status(&self) -> TranscodeStatus {
+        let ffmpeg = if self.ffmpeg().is_some() {
+            "ready"
+        } else if self
+            .ffmpeg_probe_done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            "unavailable"
+        } else {
+            "preparing"
+        };
+        let (incoming, incoming_bytes) = dir_stats(&self.incoming_dir);
+        let (audio_count, audio_bytes) = dir_stats(&self.audio_dir);
+        let (liked_count, liked_bytes) = dir_stats(&self.liked_dir);
+        let transcoding = self
+            .transcoding
+            .lock()
+            .map(|s| s.len() as u32)
+            .unwrap_or(0);
+        TranscodeStatus {
+            ffmpeg,
+            incoming,
+            incoming_bytes,
+            transcoding,
+            clean: audio_count + liked_count,
+            clean_bytes: audio_bytes + liked_bytes,
+        }
+    }
+
     fn file_path(&self, urn: &str) -> PathBuf {
         self.audio_dir.join(urn_to_filename(urn))
     }
@@ -769,24 +991,36 @@ impl TrackCacheState {
         self.liked_dir.join(urn_to_filename(urn))
     }
 
-    /// Resolve the existing cached path (liked dir takes priority).
-    /// Returns `None` if the track is not cached in either directory.
-    fn resolve_path(&self, urn: &str) -> Option<PathBuf> {
+    fn incoming_file_path(&self, urn: &str) -> PathBuf {
+        self.incoming_dir.join(urn_to_filename(urn))
+    }
+
+    /// A clean transcoded file (folder "Б") lives in the liked or audio dir, not
+    /// in the raw staging dir.
+    fn is_clean_path(&self, path: &Path) -> bool {
+        path.starts_with(&self.audio_dir) || path.starts_with(&self.liked_dir)
+    }
+
+    /// Resolve only a clean (transcoded m4a) cached path, liked dir first.
+    fn resolve_clean_path(&self, urn: &str) -> Option<PathBuf> {
         let liked = self.liked_file_path(urn);
-        if std::fs::metadata(&liked)
-            .map(|m| m.len() >= MIN_AUDIO_SIZE)
-            .unwrap_or(false)
-        {
+        if is_valid_file(&liked) {
             return Some(liked);
         }
         let audio = self.file_path(urn);
-        if std::fs::metadata(&audio)
-            .map(|m| m.len() >= MIN_AUDIO_SIZE)
-            .unwrap_or(false)
-        {
+        if is_valid_file(&audio) {
             return Some(audio);
         }
         None
+    }
+
+    /// Resolve any usable cached path: clean files first (liked, then audio),
+    /// falling back to the raw incoming file while a transcode is pending.
+    fn resolve_path(&self, urn: &str) -> Option<PathBuf> {
+        self.resolve_clean_path(urn).or_else(|| {
+            let incoming = self.incoming_file_path(urn);
+            is_valid_file(&incoming).then_some(incoming)
+        })
     }
 
     pub fn is_cached(&self, urn: &str) -> bool {
@@ -800,10 +1034,17 @@ impl TrackCacheState {
 
     pub fn get_cache_entry(&self, urn: &str) -> Option<TrackCacheEntry> {
         let path = self.resolve_path(urn)?;
-        Some(TrackCacheEntry::from_path_and_meta(
-            &path,
-            read_cache_metadata(&path),
-        ))
+        let meta = read_cache_metadata(&path);
+        // A clean file whose recorded length disagrees with the API length was a
+        // truncated download — drop it so the next request re-fetches.
+        if self.is_clean_path(&path) && !meta_duration_ok(meta.as_ref()) {
+            let line = format!("[TrackCache] dropping truncated cache for {urn}");
+            eprintln!("{line}");
+            self.diag("WARN", line);
+            self.remove_cached(urn);
+            return None;
+        }
+        Some(TrackCacheEntry::from_path_and_meta(&path, meta))
     }
 
     /// Download track, save to cache. Coalesces concurrent requests for the same URN.
@@ -839,6 +1080,7 @@ impl TrackCacheState {
             session_id,
             hq,
             liked,
+            expected_duration_ms,
         } = req;
 
         if let Some(entry) = self.get_cache_entry(urn) {
@@ -846,11 +1088,9 @@ impl TrackCacheState {
             return Ok(entry);
         }
 
-        let target_dir = if liked {
-            &self.liked_dir
-        } else {
-            &self.audio_dir
-        };
+        // Fresh bytes always land in the raw staging dir ("А"); a background
+        // transcode promotes them to the clean m4a cache ("Б") afterwards.
+        let target_dir = &self.incoming_dir;
 
         // Coalesce concurrent requests for the same URN
         let mut active = self.active.lock().await;
@@ -859,14 +1099,30 @@ impl TrackCacheState {
             let notify = existing.notify.clone();
             let result_slot = existing.result.clone();
             drop(active);
-            notify.notified().await;
-            let res = result_slot.lock().await;
-            return match res.as_ref() {
-                Some(Ok(path)) => Ok(TrackCacheEntry::from_path_and_meta(
-                    path,
-                    read_cache_metadata(path),
-                )),
-                Some(Err(e)) => Err(e.clone()),
+            // `notify_waiters()` keeps no permit for late waiters, so register the
+            // wait BEFORE re-checking the result slot. If the winner already
+            // stored its result (and possibly fired the now-lost notification),
+            // the re-check returns it; otherwise we are registered and will be
+            // woken. This closes the lost-wakeup hang.
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let mut result = result_slot.lock().await.clone();
+            if result.is_none() {
+                notified.await;
+                result = result_slot.lock().await.clone();
+            }
+            return match result {
+                Some(Ok(path)) => {
+                    // Re-resolve: the transcode may have already promoted А→Б and
+                    // deleted the raw path stored in the slot.
+                    let current = self.resolve_path(urn).unwrap_or(path);
+                    Ok(TrackCacheEntry::from_path_and_meta(
+                        &current,
+                        read_cache_metadata(&current),
+                    ))
+                }
+                Some(Err(e)) => Err(e),
                 None => Err("download completed without result".into()),
             };
         }
@@ -894,6 +1150,14 @@ impl TrackCacheState {
             })
             .await;
 
+        // Stamp the raw file with routing + integrity info, then kick off the
+        // background transcode (А → Б). Playback uses the raw path immediately.
+        if let Ok(ref incoming_path) = download_result {
+            self.finalize_incoming(incoming_path, liked, expected_duration_ms)
+                .await;
+            self.spawn_transcode(urn.to_string());
+        }
+
         {
             let mut slot = result_slot.lock().await;
             *slot = Some(download_result.clone());
@@ -901,15 +1165,316 @@ impl TrackCacheState {
         notify.notify_waiters();
         self.active.lock().await.remove(urn);
 
-        download_result
-            .map(|path| TrackCacheEntry::from_path_and_meta(&path, read_cache_metadata(&path)))
+        download_result.map(|path| {
+            // Hand back whatever currently exists (clean Б if the transcode is
+            // already done, else the raw А path) so the caller never receives a
+            // path the background transcode is about to delete.
+            let current = self.resolve_path(urn).unwrap_or(path);
+            TrackCacheEntry::from_path_and_meta(&current, read_cache_metadata(&current))
+        })
+    }
+
+    /// Record the destination (liked vs normal) and API duration on the raw
+    /// incoming file so the transcode/recovery steps can route and validate it.
+    async fn finalize_incoming(
+        &self,
+        incoming_path: &Path,
+        liked: bool,
+        expected_duration_ms: Option<u64>,
+    ) {
+        // Only stamp files that actually live in the staging dir; if a
+        // coalesced winner already produced a clean file, leave it be.
+        if !incoming_path.starts_with(&self.incoming_dir) {
+            return;
+        }
+        let mut meta = read_cache_metadata(incoming_path).unwrap_or(TrackCacheMetadata {
+            quality: PlaybackQuality::Sq,
+            source: None,
+            liked,
+            expected_duration_ms,
+            duration_ms: None,
+        });
+        meta.liked = liked;
+        if expected_duration_ms.is_some() {
+            meta.expected_duration_ms = expected_duration_ms;
+        }
+        write_cache_metadata(incoming_path, &meta).await;
+    }
+
+    /// Queue a background transcode of a raw incoming file into the clean cache.
+    /// No-op when ffmpeg is unavailable or a transcode for this URN is already
+    /// in flight (live request and startup recovery coalesce on the same set).
+    fn spawn_transcode(&self, urn: String) {
+        let Some(ffmpeg) = self.ffmpeg() else {
+            return;
+        };
+        {
+            let Ok(mut set) = self.transcoding.lock() else {
+                return;
+            };
+            if !set.insert(urn.clone()) {
+                return;
+            }
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            if let Err(e) = state.run_transcode(&ffmpeg, &urn).await {
+                let line = format!("[TrackCache] transcode failed for {urn}: {e}");
+                eprintln!("{line}");
+                state.diag("WARN", line);
+            }
+            if let Ok(mut set) = state.transcoding.lock() {
+                set.remove(&urn);
+            }
+        });
+    }
+
+    /// Transcode `incoming_dir/<urn>` → clean m4a in the routed dest dir, then
+    /// drop the raw file. Validates the result against the API duration and
+    /// discards truncated downloads. Caller owns the `transcoding` dedup slot.
+    async fn run_transcode(&self, ffmpeg: &Path, urn: &str) -> Result<(), String> {
+        let _permit = self
+            .transcode_limiter
+            .acquire()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let incoming = self.incoming_file_path(urn);
+        if !is_valid_file(&incoming) {
+            return Ok(()); // already promoted, evicted, or never landed
+        }
+
+        let meta = read_cache_metadata(&incoming);
+        let liked = meta.as_ref().map(|m| m.liked).unwrap_or(false);
+        let expected = meta.as_ref().and_then(|m| m.expected_duration_ms);
+        let quality = meta
+            .as_ref()
+            .map(|m| m.quality)
+            .unwrap_or(PlaybackQuality::Sq);
+        let source = meta.as_ref().and_then(|m| m.source);
+        let dest_dir = if liked {
+            self.liked_dir.clone()
+        } else {
+            self.audio_dir.clone()
+        };
+
+        // Clean file already present (e.g. promoted by a prior run) — drop the
+        // raw file after a grace period (a player may still hold its path).
+        if is_valid_file(&dest_dir.join(urn_to_filename(urn))) {
+            self.schedule_remove_incoming(urn.to_string());
+            return Ok(());
+        }
+
+        let final_name = urn_to_filename(urn);
+        let clean_path = transcode::transcode_to_m4a(ffmpeg, &incoming, &dest_dir, &final_name).await?;
+
+        let probed = transcode::probe_duration_ms(ffmpeg, &clean_path).await;
+
+        // The transcode faithfully reproduces the source, so a too-short result
+        // means the *download* was cut off — discard so the next play retries.
+        // But cap retries: if a track is *consistently* short, its only stream is
+        // a preview, so accept it (align expected→actual) instead of looping.
+        let mut accepted_expected = expected;
+        if let (Some(actual), Some(exp)) = (probed, expected) {
+            if !cached_duration_ok(actual, exp) {
+                let attempts = self.note_truncated(urn);
+                if attempts <= MAX_TRUNCATED_RETRIES {
+                    let line = format!(
+                        "[TrackCache] {urn} transcoded short ({actual}ms vs {exp}ms) — discarding (attempt {attempts})"
+                    );
+                    eprintln!("{line}");
+                    self.diag("WARN", line);
+                    tokio::fs::remove_file(&clean_path).await.ok();
+                    tokio::fs::remove_file(cache_metadata_path(&clean_path)).await.ok();
+                    self.remove_incoming(urn).await;
+                    return Ok(());
+                }
+                let line =
+                    format!("[TrackCache] {urn}: only a {actual}ms preview is available — keeping it");
+                eprintln!("{line}");
+                self.diag("WARN", line);
+                accepted_expected = probed; // stop flagging this file as truncated
+            }
+        }
+        self.clear_truncated(urn);
+
+        let clean_meta = TrackCacheMetadata {
+            quality,
+            source,
+            liked,
+            expected_duration_ms: accepted_expected,
+            duration_ms: probed,
+        };
+        write_cache_metadata(&clean_path, &clean_meta).await;
+        // Defer dropping the raw А file: the path may have just been handed to the
+        // player, which reads it a moment later in a separate command.
+        self.schedule_remove_incoming(urn.to_string());
+        println!("[TrackCache] transcoded {urn} → {}", clean_path.display());
+        Ok(())
+    }
+
+    async fn remove_incoming(&self, urn: &str) {
+        let path = self.incoming_file_path(urn);
+        tokio::fs::remove_file(&path).await.ok();
+        tokio::fs::remove_file(cache_metadata_path(&path)).await.ok();
+    }
+
+    /// Delete the raw А file after a grace period, so a path just handed to the
+    /// player survives the brief gap before it is read. Re-checks at fire time:
+    /// only drops А when its clean Б is present and no fresh transcode is running
+    /// (guards against nuking a new download cycle for the same URN).
+    fn schedule_remove_incoming(&self, urn: String) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(INCOMING_GRACE_SECS)).await;
+            let in_flight = state
+                .transcoding
+                .lock()
+                .map(|s| s.contains(&urn))
+                .unwrap_or(true);
+            if !in_flight && state.resolve_clean_path(&urn).is_some() {
+                state.remove_incoming(&urn).await;
+            }
+        });
+    }
+
+    /// Record a "transcoded too short" result and return the running count.
+    /// A poisoned lock returns `u8::MAX` so the caller stops retrying (safe).
+    fn note_truncated(&self, urn: &str) -> u8 {
+        let Ok(mut map) = self.truncated_retries.lock() else {
+            return u8::MAX;
+        };
+        let count = map.entry(urn.to_string()).or_insert(0);
+        *count = count.saturating_add(1);
+        *count
+    }
+
+    fn clear_truncated(&self, urn: &str) {
+        if let Ok(mut map) = self.truncated_retries.lock() {
+            map.remove(urn);
+        }
+    }
+
+    /// On startup (after ffmpeg is acquired): re-queue transcodes for any raw
+    /// files left in the staging dir by a crash or by downloads that happened
+    /// before ffmpeg was ready. Temp files were already swept synchronously in
+    /// `init()`, before any live writer could exist.
+    pub async fn recover_incoming(&self) {
+        if self.ffmpeg().is_none() {
+            return;
+        }
+        let urns = list_incoming_urns(&self.incoming_dir);
+        if !urns.is_empty() {
+            let line = format!("[TrackCache] recovering {} incoming track(s)", urns.len());
+            println!("{line}");
+            self.diag("INFO", line);
+        }
+        for urn in urns {
+            self.spawn_transcode(urn);
+        }
+    }
+
+    /// Ensure a clean m4a exists for export, coalescing with any background
+    /// transcode via the shared dedup set. Returns the clean path, or `None` if
+    /// no clean file could be produced (caller falls back to the raw bytes).
+    async fn ensure_clean_for_export(&self, urn: &str, ffmpeg: &Path) -> Option<PathBuf> {
+        if let Some(path) = self.resolve_clean_path(urn) {
+            return Some(path);
+        }
+        let claimed = self
+            .transcoding
+            .lock()
+            .ok()
+            .map(|mut set| set.insert(urn.to_string()))
+            .unwrap_or(false);
+        if claimed {
+            let _ = self.run_transcode(ffmpeg, urn).await;
+            if let Ok(mut set) = self.transcoding.lock() {
+                set.remove(urn);
+            }
+        } else {
+            // A background transcode owns the slot — wait for the clean file.
+            for _ in 0..150 {
+                if self.resolve_clean_path(urn).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        }
+        self.resolve_clean_path(urn)
+    }
+
+    async fn fetch_cover(&self, url: &str) -> Option<Vec<u8>> {
+        let resp = self.client.get(url).send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        if resp.content_length().map(|l| l > MAX_COVER_BYTES).unwrap_or(false) {
+            return None;
+        }
+        let bytes = resp.bytes().await.ok()?;
+        if bytes.is_empty() || bytes.len() as u64 > MAX_COVER_BYTES {
+            return None;
+        }
+        Some(bytes.to_vec())
+    }
+
+    /// Download-to-file: prefer the clean m4a cache, transcode raw bytes when
+    /// only those exist, else fetch from streaming — then write `dest_path`
+    /// (m4a) with the cover art embedded when ffmpeg is available.
+    pub async fn export_track(
+        &self,
+        req: CacheRequest<'_>,
+        dest_path: String,
+        cover_url: Option<String>,
+    ) -> Result<String, String> {
+        let urn = req.urn.to_string();
+        let dest = PathBuf::from(&dest_path);
+
+        // Make sure we at least have raw bytes (downloads + spawns bg transcode).
+        let entry = self.ensure_cached(req).await?;
+        let mut source_path = PathBuf::from(&entry.path);
+
+        if let Some(ffmpeg) = self.ffmpeg() {
+            if let Some(clean) = self.ensure_clean_for_export(&urn, &ffmpeg).await {
+                source_path = clean;
+            }
+            if self.is_clean_path(&source_path) {
+                let cover = match cover_url {
+                    Some(u) if !u.is_empty() => self.fetch_cover(&u).await,
+                    _ => None,
+                };
+                match transcode::export_with_cover(&ffmpeg, &source_path, cover.as_deref(), &dest)
+                    .await
+                {
+                    Ok(()) => return Ok(dest_path),
+                    Err(e) if cover.is_some() => {
+                        // A bad cover shouldn't sink the download — retry artless.
+                        eprintln!("[TrackCache] export with cover failed ({e}), retrying without");
+                        transcode::export_with_cover(&ffmpeg, &source_path, None, &dest).await?;
+                        return Ok(dest_path);
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        // No clean m4a available (ffmpeg unavailable, or the transcode failed /
+        // timed out). Re-resolve in case a concurrent transcode finished and
+        // deleted the raw path we held, then only copy if the source is already a
+        // valid m4a — never write mismatched bytes into the user's .m4a file.
+        let fallback = self.resolve_path(&urn).unwrap_or(source_path);
+        if self.is_clean_path(&fallback) || transcode::is_m4a(&fallback).await {
+            tokio::fs::copy(&fallback, &dest)
+                .await
+                .map_err(|e| format!("Copy failed: {e}"))?;
+            return Ok(dest_path);
+        }
+        Err("Cannot export to m4a: audio transcoder is still preparing or unavailable".into())
     }
 
     /// Try each storage URL once (healthy hosts first), then API URLs with retries.
-    async fn download_with_fallback(
-        &self,
-        params: FallbackParams<'_>,
-    ) -> Result<PathBuf, String> {
+    async fn download_with_fallback(&self, params: FallbackParams<'_>) -> Result<PathBuf, String> {
         let FallbackParams {
             target_dir,
             urn,
@@ -1105,15 +1670,7 @@ impl TrackCacheState {
         // First success wins, the loser is dropped → reqwest cancels its connection.
         if !download_urls.is_empty() || !urls.is_empty() {
             match self
-                .race_direct_and_api(
-                    target_dir,
-                    urn,
-                    download_urls,
-                    urls,
-                    session_id,
-                    hq,
-                    start,
-                )
+                .race_direct_and_api(target_dir, urn, download_urls, urls, session_id, hq, start)
                 .await
             {
                 Ok(path) => return Ok(path),
@@ -1163,8 +1720,7 @@ impl TrackCacheState {
                     .map(|m| m.len() / 1024)
                     .unwrap_or(0);
                 let ms = start.elapsed().as_millis();
-                let line =
-                    format!("[TrackCache] downloaded {urn} via direct — {kb} KB in {ms}ms");
+                let line = format!("[TrackCache] downloaded {urn} via direct — {kb} KB in {ms}ms");
                 println!("{line}");
                 self.diag("INFO", line);
                 Ok(res.path)
@@ -1192,9 +1748,10 @@ impl TrackCacheState {
             return Err("no /stream URLs".into());
         }
 
-        let mut futures: Vec<
-            std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<PathBuf, String>)> + Send>>,
-        > = urls
+        type DownloadFut = std::pin::Pin<
+            Box<dyn std::future::Future<Output = (usize, Result<PathBuf, String>)> + Send>,
+        >;
+        let mut futures: Vec<DownloadFut> = urls
             .iter()
             .enumerate()
             .map(|(i, url)| {
@@ -1206,18 +1763,10 @@ impl TrackCacheState {
                 println!("[TrackCache] trying URL #{} for {urn} - {url}", i + 1);
                 Box::pin(async move {
                     let res = state
-                        .download_api_with_retries(
-                            &target_dir,
-                            &urn,
-                            &url,
-                            session_id.as_deref(),
-                        )
+                        .download_api_with_retries(&target_dir, &urn, &url, session_id.as_deref())
                         .await;
                     (i, res)
-                })
-                    as std::pin::Pin<
-                        Box<dyn std::future::Future<Output = (usize, Result<PathBuf, String>)> + Send>,
-                    >
+                }) as DownloadFut
             })
             .collect();
 
@@ -1246,6 +1795,9 @@ impl TrackCacheState {
 
     /// Run direct (`/download`) and api (`/stream`) in parallel; first success
     /// returns its path, the loser is cancelled by being dropped.
+    // Bundling these into a struct would only push the same 8 args from one
+    // call site into a struct literal at the same call site.
+    #[allow(clippy::too_many_arguments)]
     async fn race_direct_and_api(
         &self,
         target_dir: &Path,
@@ -1336,7 +1888,7 @@ impl TrackCacheState {
     }
 
     pub fn cache_size(&self) -> u64 {
-        dir_size(&self.audio_dir)
+        dir_size(&self.audio_dir) + dir_size(&self.incoming_dir)
     }
 
     pub fn liked_cache_size(&self) -> u64 {
@@ -1488,6 +2040,7 @@ impl TrackCacheState {
                     storage_urls,
                     session_id,
                     hq,
+                    duration_ms,
                 } = entry;
                 let result = state
                     .ensure_cached(CacheRequest {
@@ -1498,6 +2051,7 @@ impl TrackCacheState {
                         session_id: session_id.as_deref(),
                         hq,
                         liked: true,
+                        expected_duration_ms: duration_ms,
                     })
                     .await;
                 if result.is_err() {
@@ -1582,6 +2136,7 @@ impl TrackCacheState {
 
     pub fn clear_cache(&self) {
         clear_audio_dir(&self.audio_dir);
+        clear_audio_dir(&self.incoming_dir);
     }
 
     pub fn clear_liked_cache(&self) {
@@ -1590,7 +2145,11 @@ impl TrackCacheState {
 
     pub fn remove_cached(&self, urn: &str) -> bool {
         let mut removed = false;
-        for path in [self.liked_file_path(urn), self.file_path(urn)] {
+        for path in [
+            self.liked_file_path(urn),
+            self.file_path(urn),
+            self.incoming_file_path(urn),
+        ] {
             if std::fs::metadata(&path).is_ok() {
                 if std::fs::remove_file(&path).is_ok() {
                     removed = true;
@@ -1604,7 +2163,7 @@ impl TrackCacheState {
     pub fn list_cached_urns(&self) -> Vec<String> {
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut urns: Vec<String> = Vec::new();
-        for dir in [&self.liked_dir, &self.audio_dir] {
+        for dir in [&self.liked_dir, &self.audio_dir, &self.incoming_dir] {
             collect_cached_urns(dir, &mut seen, &mut urns);
         }
         urns
@@ -1619,11 +2178,39 @@ impl TrackCacheState {
         let mut files: Vec<(PathBuf, u64, std::time::SystemTime)> = Vec::new();
         let mut total = 0u64;
 
-        if let Ok(entries) = std::fs::read_dir(&self.audio_dir) {
+        // URNs with a transcode in flight — their raw source must not be evicted
+        // out from under the А→Б promotion.
+        let in_flight = self
+            .transcoding
+            .lock()
+            .ok()
+            .map(|s| s.clone())
+            .unwrap_or_default();
+
+        // Account for both the clean cache ("Б") and any raw staging files ("А")
+        // so a build without ffmpeg (which keeps serving raw bytes) stays bounded.
+        for dir in [&self.audio_dir, &self.incoming_dir] {
+            let is_incoming = *dir == self.incoming_dir;
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                continue;
+            };
             for entry in entries.flatten() {
                 let path = entry.path();
                 if !is_audio_cache_file(&path) {
                     continue;
+                }
+                // Protect staged files that are liked-bound or mid-promotion: a
+                // raw file evicted here would silently cancel the user's cache and,
+                // for liked tracks, defeat the dedicated protected quota.
+                if is_incoming {
+                    if let Some(urn) = filename_to_urn(&entry.file_name().to_string_lossy()) {
+                        if in_flight.contains(&urn) {
+                            continue;
+                        }
+                    }
+                    if read_cache_metadata(&path).map(|m| m.liked).unwrap_or(false) {
+                        continue;
+                    }
                 }
                 if let Ok(meta) = entry.metadata() {
                     if meta.is_file() {
@@ -1644,7 +2231,7 @@ impl TrackCacheState {
         }
 
         let before = total;
-        files.sort_by(|a, b| a.2.cmp(&b.2));
+        files.sort_by_key(|x| x.2);
 
         let mut removed = 0u32;
         for (path, size, _) in files {

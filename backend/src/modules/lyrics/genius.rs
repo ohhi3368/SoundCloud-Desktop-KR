@@ -1,22 +1,25 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures::future::join_all;
 use once_cell::sync::Lazy;
 use regex::Regex;
 use reqwest::header::HeaderMap;
 use serde::Deserialize;
-use tracing::debug;
+use tokio::sync::Semaphore;
+use tracing::warn;
 
 use crate::common::external_fetch::ExternalFetcher;
 use crate::common::throttle::Throttle;
 use crate::config::GeniusCfg;
+use crate::error::{AppError, AppResult};
 
 const GENIUS_API: &str = "https://api.genius.com";
 const GENIUS_WEB_API: &str = "https://genius.com/api";
 const UA: &str = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36";
 
-const API_THROTTLE_MS: u64 = 500;
-const WEB_DIRECT_THROTTLE_MS: u64 = 3000;
+const API_THROTTLE_MS: u64 = 0;
+const WEB_DIRECT_THROTTLE_MS: u64 = 0;
 
 static RE_OPEN: Lazy<Regex> =
     Lazy::new(|| Regex::new(r#"(?i)<div\b[^>]*\bdata-lyrics-container="true"[^>]*>"#).unwrap());
@@ -215,6 +218,19 @@ struct AlbumPayload {
 struct ReleaseDate {
     #[serde(default)]
     year: Option<i32>,
+    #[serde(default)]
+    month: Option<u32>,
+    #[serde(default)]
+    day: Option<u32>,
+}
+
+impl ReleaseDate {
+    fn full_date(&self) -> Option<chrono::NaiveDate> {
+        let y = self.year?;
+        let m = self.month?.clamp(1, 12);
+        let d = self.day?.clamp(1, 31);
+        chrono::NaiveDate::from_ymd_opt(y, m, d)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -245,6 +261,7 @@ pub struct GeniusAlbumRef {
     pub genius_album_id: i64,
     pub name: String,
     pub year: Option<i16>,
+    pub release_date: Option<chrono::NaiveDate>,
     pub cover_url: Option<String>,
 }
 
@@ -252,6 +269,7 @@ pub struct GeniusAlbumRef {
 pub struct GeniusSongDetails {
     pub album: Option<GeniusAlbumRef>,
     pub year: Option<i16>,
+    pub release_date: Option<chrono::NaiveDate>,
 }
 
 #[derive(Debug, Clone)]
@@ -268,15 +286,18 @@ pub struct GeniusService {
     cfg: GeniusCfg,
     api_throttle: Arc<Throttle>,
     web_throttle: Arc<Throttle>,
+    scrape_sem: Arc<Semaphore>,
 }
 
 impl GeniusService {
     pub fn new(fetcher: Arc<ExternalFetcher>, cfg: GeniusCfg) -> Arc<Self> {
+        let scrape_sem = Arc::new(Semaphore::new(cfg.max_concurrent_scrapes.max(1)));
         Arc::new(Self {
             fetcher,
             cfg,
             api_throttle: Throttle::new(Duration::from_millis(API_THROTTLE_MS)),
             web_throttle: Throttle::new(Duration::from_millis(WEB_DIRECT_THROTTLE_MS)),
+            scrape_sem,
         })
     }
 
@@ -310,36 +331,44 @@ impl GeniusService {
         format!("{GENIUS_API}{path}")
     }
 
-    async fn fetch_json<T>(&self, url: &str, label: &str) -> Option<T>
+    async fn fetch_json_strict<T>(&self, url: &str, label: &str) -> AppResult<T>
     where
         T: for<'de> Deserialize<'de>,
     {
         let with_bearer = url.starts_with(GENIUS_API);
         let headers = self.json_headers(with_bearer);
-        let result = if with_bearer {
+        let _permit = self.scrape_sem.acquire().await.ok();
+        let bytes = if with_bearer {
             self.fetcher.get_api(url, headers, &self.api_throttle).await
         } else {
             self.fetcher
                 .get_scrape(url, headers, &self.web_throttle)
                 .await
-        };
-        let bytes = match result {
-            Ok(b) => b,
+        }?;
+        serde_json::from_slice::<T>(&bytes).map_err(|e| {
+            let head: String = String::from_utf8_lossy(&bytes).chars().take(80).collect();
+            warn!(url, label, error = %e, head = %head, "genius parse failed");
+            AppError::internal(format!("genius parse {label}: {e}"))
+        })
+    }
+
+    async fn fetch_json<T>(&self, url: &str, label: &str) -> Option<T>
+    where
+        T: for<'de> Deserialize<'de>,
+    {
+        match self.fetch_json_strict(url, label).await {
+            Ok(v) => Some(v),
+            // parse failures already warn inside fetch_json_strict; log fetch/transport here
+            Err(AppError::Internal(_)) => None,
             Err(e) => {
-                debug!(url, label, error = %e, "genius fetch failed");
-                return None;
-            }
-        };
-        match serde_json::from_slice::<T>(&bytes) {
-            Ok(d) => Some(d),
-            Err(e) => {
-                debug!(url, label, error = %e, "genius parse failed");
+                warn!(url, label, error = %e, "genius fetch failed");
                 None
             }
         }
     }
 
     async fn fetch_html(&self, url: &str) -> Option<String> {
+        let _permit = self.scrape_sem.acquire().await.ok();
         let bytes = match self
             .fetcher
             .get_scrape(url, self.html_headers(), &self.web_throttle)
@@ -347,7 +376,7 @@ impl GeniusService {
         {
             Ok(b) => b,
             Err(e) => {
-                debug!(url, error = %e, "genius html fetch failed");
+                warn!(url, error = %e, "genius html fetch failed");
                 return None;
             }
         };
@@ -359,20 +388,13 @@ impl GeniusService {
         genius_id: i64,
         page: u32,
         per_page: u32,
-    ) -> Vec<GeniusSongMeta> {
+    ) -> AppResult<Vec<GeniusSongMeta>> {
         let per = per_page.clamp(1, 50);
         let pg = page.max(1);
         let path = format!("/artists/{genius_id}/songs?per_page={per}&page={pg}&sort=popularity");
-        let url = if self.has_token() {
-            self.api(&path)
-        } else {
-            self.web_api(&path)
-        };
-        let parsed: ArtistSongsResp = match self.fetch_json(&url, "artist songs").await {
-            Some(d) => d,
-            None => return Vec::new(),
-        };
-        parsed
+        let url = self.web_api(&path);
+        let parsed: ArtistSongsResp = self.fetch_json_strict(&url, "artist songs").await?;
+        Ok(parsed
             .response
             .map(|r| r.songs.unwrap_or_default())
             .unwrap_or_default()
@@ -392,7 +414,7 @@ impl GeniusService {
                     featured,
                 })
             })
-            .collect()
+            .collect())
     }
 
     pub async fn list_artist_albums(
@@ -400,16 +422,13 @@ impl GeniusService {
         genius_id: i64,
         page: u32,
         per_page: u32,
-    ) -> (Vec<GeniusAlbumRef>, bool) {
+    ) -> AppResult<(Vec<GeniusAlbumRef>, bool)> {
         let per = per_page.clamp(1, 50);
         let pg = page.max(1);
         let url = self.web_api(&format!(
             "/artists/{genius_id}/albums?per_page={per}&page={pg}"
         ));
-        let parsed: ArtistAlbumsResp = match self.fetch_json(&url, "artist albums").await {
-            Some(d) => d,
-            None => return (Vec::new(), false),
-        };
+        let parsed: ArtistAlbumsResp = self.fetch_json_strict(&url, "artist albums").await?;
         let body = parsed.response.unwrap_or(ArtistAlbumsBody {
             albums: None,
             next_page: None,
@@ -425,19 +444,22 @@ impl GeniusService {
                     .name
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())?;
-                let year = a
-                    .release_date_components
+                let rd = a.release_date_components;
+                let year = rd
+                    .as_ref()
                     .and_then(|d| d.year)
                     .and_then(|y| i16::try_from(y).ok());
+                let release_date = rd.as_ref().and_then(ReleaseDate::full_date);
                 Some(GeniusAlbumRef {
                     genius_album_id: id,
                     name,
                     year,
+                    release_date,
                     cover_url: a.cover_art_url.filter(|s| !s.is_empty()),
                 })
             })
             .collect();
-        (out, has_more)
+        Ok((out, has_more))
     }
 
     pub async fn list_album_tracks(
@@ -445,16 +467,13 @@ impl GeniusService {
         genius_album_id: i64,
         page: u32,
         per_page: u32,
-    ) -> (Vec<GeniusAlbumTrack>, bool) {
+    ) -> AppResult<(Vec<GeniusAlbumTrack>, bool)> {
         let per = per_page.clamp(1, 50);
         let pg = page.max(1);
         let url = self.web_api(&format!(
             "/albums/{genius_album_id}/tracks?per_page={per}&page={pg}"
         ));
-        let parsed: AlbumTracksResp = match self.fetch_json(&url, "album tracks").await {
-            Some(d) => d,
-            None => return (Vec::new(), false),
-        };
+        let parsed: AlbumTracksResp = self.fetch_json_strict(&url, "album tracks").await?;
         let body = parsed.response.unwrap_or(AlbumTracksBody {
             tracks: None,
             next_page: None,
@@ -486,52 +505,50 @@ impl GeniusService {
                 })
             })
             .collect();
-        (tracks, has_more)
+        Ok((tracks, has_more))
     }
 
     pub async fn lookup_song(&self, genius_song_id: i64) -> Option<GeniusSongDetails> {
         let path = format!("/songs/{genius_song_id}");
-        let url = if self.has_token() {
-            self.api(&path)
-        } else {
-            self.web_api(&path)
-        };
+        let url = self.web_api(&path);
         let parsed: SongResp = self.fetch_json(&url, "song").await?;
         let song = parsed.response.and_then(|r| r.song)?;
-        let song_year = song
-            .release_date_components
+        let song_rd = song.release_date_components;
+        let song_year = song_rd
+            .as_ref()
             .and_then(|d| d.year)
             .and_then(|y| i16::try_from(y).ok());
+        let song_date = song_rd.as_ref().and_then(ReleaseDate::full_date);
         let album = song.album.and_then(|a| {
             let id = a.id?;
             let name = a
                 .name
                 .map(|s| s.trim().to_string())
                 .filter(|s| !s.is_empty())?;
-            let year = a
-                .release_date_components
+            let rd = a.release_date_components;
+            let year = rd
+                .as_ref()
                 .and_then(|d| d.year)
                 .and_then(|y| i16::try_from(y).ok());
+            let release_date = rd.as_ref().and_then(ReleaseDate::full_date);
             Some(GeniusAlbumRef {
                 genius_album_id: id,
                 name,
                 year,
+                release_date,
                 cover_url: a.cover_art_url,
             })
         });
         Some(GeniusSongDetails {
             album,
             year: song_year,
+            release_date: song_date,
         })
     }
 
     pub async fn lookup_artist(&self, genius_id: i64) -> Option<GeniusArtistDetails> {
         let path = format!("/artists/{genius_id}");
-        let url = if self.has_token() {
-            self.api(&path)
-        } else {
-            self.web_api(&path)
-        };
+        let url = self.web_api(&path);
         let parsed: ArtistResp = self.fetch_json(&url, "artist").await?;
         let a = parsed.response.and_then(|r| r.artist)?;
         Some(GeniusArtistDetails {
@@ -623,21 +640,16 @@ impl GeniusService {
 
     pub async fn search_by_query(&self, q: &str, limit: usize) -> Vec<GeniusCandidate> {
         let hits = self.collect_lyric_hits(q, limit).await;
-        let mut out = Vec::new();
-        for hit in hits.into_iter().take(limit) {
-            let html = match self.fetch_html(&hit.url).await {
-                Some(t) => t,
-                None => continue,
-            };
-            if let Some(plain) = parse_lyrics_html(&html) {
-                out.push(GeniusCandidate {
-                    plain_text: plain,
-                    artist_guess: hit.artist,
-                    title_guess: hit.title,
-                });
-            }
-        }
-        out
+        let scrapes = hits.into_iter().take(limit).map(|hit| async move {
+            let html = self.fetch_html(&hit.url).await?;
+            let plain = parse_lyrics_html(&html)?;
+            Some(GeniusCandidate {
+                plain_text: plain,
+                artist_guess: hit.artist,
+                title_guess: hit.title,
+            })
+        });
+        join_all(scrapes).await.into_iter().flatten().collect()
     }
 
     /// Собирает список Genius-кандидатов для скрейпа лирики:
@@ -776,10 +788,7 @@ fn extract_balanced_div_content(html: &str, start_pos: usize) -> Option<String> 
     while pos < len && depth > 0 {
         let next_open = find_subseq(bytes, pos, b"<div");
         let next_close = find_subseq(bytes, pos, b"</div");
-        let nc = match next_close {
-            Some(p) => p,
-            None => return None,
-        };
+        let nc = next_close?;
         match next_open {
             Some(no) if no < nc => {
                 let after_idx = no + 4;
@@ -831,6 +840,7 @@ mod tests {
             fetcher,
             GeniusCfg {
                 access_token: String::new(),
+                max_concurrent_scrapes: 50,
             },
         )
     }
@@ -857,7 +867,7 @@ mod tests {
     #[ignore]
     async fn live_list_psychosis_albums() {
         let svc = build_client();
-        let (albums, _has_more) = svc.list_artist_albums(3401261, 1, 20).await;
+        let (albums, _has_more) = svc.list_artist_albums(3401261, 1, 20).await.unwrap();
         assert!(
             albums.len() >= 5,
             "expected several albums, got {}",
@@ -875,7 +885,7 @@ mod tests {
     #[ignore]
     async fn live_album_tracks_euphoria() {
         let svc = build_client();
-        let (tracks, _) = svc.list_album_tracks(1222807, 1, 50).await;
+        let (tracks, _) = svc.list_album_tracks(1222807, 1, 50).await.unwrap();
         assert!(tracks.len() >= 5);
         assert!(tracks.iter().all(|t| t.genius_song_id > 0));
     }
