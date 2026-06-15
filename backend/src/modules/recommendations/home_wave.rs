@@ -31,9 +31,10 @@ const ALL_CLUSTERS: &[&str] = &[
     "deep_cuts",
 ];
 
-/// Короткий TTL кэша ответа главной — снимает повтор тяжёлой ANN-сборки
-/// кластеров при частых заходах, при этом главная не «застывает».
-const HOME_CACHE_TTL: u64 = 30;
+/// TTL кэша ответов кластерных страниц (home/similar/artist). Длинный, т.к.
+/// волна реально меняется редко; инвалидация по «отпечатку вкуса» (лайки/дизы)
+/// делает выдачу свежей мгновенно, TTL лишь бьёт play-stale + брошенные ключи.
+const CLUSTER_CACHE_TTL: u64 = 600;
 const WAVE_LIMIT: usize = 24;
 const POOL_FOR_VIBE_DEEP: usize = 500;
 const NEIGHBORS_TOP_LIMIT: i64 = 16;
@@ -45,14 +46,9 @@ pub struct HomeRequest {
     pub sc_user_id: String,
     pub languages: Option<Vec<String>>,
     pub per_cluster: usize,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct ArtistTrackRow {
-    artist_id: Uuid,
-    artist_name: String,
-    avatar_url: Option<String>,
-    sc_track_id: String,
+    /// «Скрыть прослушанное» — тиерно режем недавно слушанное (лайк 7д ·
+    /// full_play 14д · skip 30д) вместо слепого played-дедупа.
+    pub hide_listened: bool,
 }
 
 impl RecommendationsService {
@@ -70,8 +66,17 @@ impl RecommendationsService {
                 .await;
         }
 
-        let exclude_set: HashSet<String> = signals
-            .played
+        // «Скрыть прослушанное» (тиерно 7/14/30д) вместо слепого played; диз — всегда.
+        let hidden_listen = if req.hide_listened {
+            super::smart_wave::signals::load_hidden_by_listen(
+                &self.pg,
+                &user_id_variants(&sc_user_id),
+            )
+            .await
+        } else {
+            Vec::new()
+        };
+        let exclude_set: HashSet<String> = hidden_listen
             .iter()
             .chain(signals.disliked_ids.iter())
             .cloned()
@@ -90,6 +95,7 @@ impl RecommendationsService {
             languages,
             SmartWaveSeed::User,
             WAVE_LIMIT,
+            req.hide_listened,
         );
 
         let (taste_modes, session_ctx, hour_ctx, anti_centroid, bandit_stats, wave_ids) = tokio::join!(
@@ -212,35 +218,112 @@ impl RecommendationsService {
         Ok(response)
     }
 
-    /// `home_wave` с коротким Redis-кэшем ответа (per user/lang/limit). На хит
-    /// отдаём готовый JSON, пропуская тяжёлую ANN-сборку (и её side-effects:
+    /// `home_wave` с Redis-кэшем ответа (per user/fingerprint/lang/limit). На
+    /// хит отдаём готовый JSON, пропуская тяжёлую ANN-сборку (и её side-effects:
     /// impression-лог + bandit-show — чтобы не двоить на повторном показе).
-    /// Возвращаем сериализованный JSON (Cluster.id = `&'static str`, поэтому
-    /// десериализовать ответ нельзя — кэшируем именно строку).
+    /// Кэшируем JSON-строку: `Cluster.id = &'static str` не десериализуется.
     pub async fn home_wave_cached(&self, req: HomeRequest) -> AppResult<String> {
+        let fp = self.taste_fingerprint(&req.sc_user_id).await;
         let lang = req
             .languages
             .as_ref()
             .map(|l| l.join(","))
             .unwrap_or_default();
-        let key = format!("rec:home:{}:{}:{}", req.sc_user_id, lang, req.per_cluster);
-
-        if let Ok(mut conn) = self.redis.get().await {
-            if let Ok(Some(cached)) = conn.get::<_, Option<String>>(&key).await {
-                return Ok(cached);
-            }
+        let key = format!(
+            "rec:home:{}:{}:{}:{}:{}",
+            req.sc_user_id, fp, lang, req.per_cluster, req.hide_listened
+        );
+        if let Some(cached) = self.cluster_cache_get(&key).await {
+            return Ok(cached);
         }
-
         let resp = self.home_wave(req).await?;
-        let json = serde_json::to_string(&resp)
-            .unwrap_or_else(|_| String::from("{\"clusters\":[]}"));
-
-        if let Ok(mut conn) = self.redis.get().await {
-            let _: Result<(), _> = conn
-                .set_ex::<_, _, ()>(&key, json.as_str(), HOME_CACHE_TTL)
-                .await;
-        }
+        let json =
+            serde_json::to_string(&resp).unwrap_or_else(|_| String::from("{\"clusters\":[]}"));
+        self.cluster_cache_put(&key, &json, CLUSTER_CACHE_TTL).await;
         Ok(json)
+    }
+
+    /// `similar_wave` (страница трека) с тем же кэшем (per user-fp/track/lang/limit).
+    pub async fn similar_wave_cached(
+        &self,
+        sc_track_id: &str,
+        sc_user_id: &str,
+        languages: Option<&[String]>,
+        per_cluster: usize,
+        hide_listened: bool,
+    ) -> AppResult<String> {
+        let fp = self.taste_fingerprint(sc_user_id).await;
+        let lang = languages.map(|l| l.join(",")).unwrap_or_default();
+        let key =
+            format!("rec:sim:{sc_user_id}:{fp}:{sc_track_id}:{lang}:{per_cluster}:{hide_listened}");
+        if let Some(cached) = self.cluster_cache_get(&key).await {
+            return Ok(cached);
+        }
+        let resp = self
+            .similar_wave(
+                sc_track_id,
+                sc_user_id,
+                languages,
+                per_cluster,
+                hide_listened,
+            )
+            .await?;
+        let json =
+            serde_json::to_string(&resp).unwrap_or_else(|_| String::from("{\"clusters\":[]}"));
+        self.cluster_cache_put(&key, &json, CLUSTER_CACHE_TTL).await;
+        Ok(json)
+    }
+
+    /// `artist_wave` (страница артиста) с тем же кэшем (per user-fp/artist/limit).
+    pub async fn artist_wave_cached(
+        &self,
+        artist_id: Uuid,
+        sc_user_id: &str,
+        per_cluster: usize,
+        hide_listened: bool,
+    ) -> AppResult<String> {
+        let fp = self.taste_fingerprint(sc_user_id).await;
+        let key = format!("rec:art:{sc_user_id}:{fp}:{artist_id}:{per_cluster}:{hide_listened}");
+        if let Some(cached) = self.cluster_cache_get(&key).await {
+            return Ok(cached);
+        }
+        let resp = self
+            .artist_wave(artist_id, sc_user_id, per_cluster, hide_listened)
+            .await?;
+        let json =
+            serde_json::to_string(&resp).unwrap_or_else(|_| String::from("{\"clusters\":[]}"));
+        self.cluster_cache_put(&key, &json, CLUSTER_CACHE_TTL).await;
+        Ok(json)
+    }
+
+    /// «Отпечаток вкуса» — дешёвый индексный запрос. Меняется при лайке/анлайке
+    /// (count+max лайков) и дизлайке (count дизов) → ключ кэша протухает сам,
+    /// без проводки инвалидации в event-сервис. Плеи в отпечаток НЕ входят
+    /// (слишком часто) → сыгранное может повисеть в снапшоте ≤TTL (ок).
+    pub(crate) async fn taste_fingerprint(&self, sc_user_id: &str) -> String {
+        let ids = user_id_variants(sc_user_id);
+        let (likes, last_like, dislikes) = match sqlx::query_file!(
+            "queries/recommendations/home_wave/taste_fingerprint.sql",
+            &ids
+        )
+        .fetch_one(&self.pg)
+        .await
+        {
+            Ok(r) => (r.likes, r.last_like, r.dislikes),
+            Err(_) => (0, 0, 0),
+        };
+        format!("{likes}-{last_like}-{dislikes}")
+    }
+
+    pub(crate) async fn cluster_cache_get(&self, key: &str) -> Option<String> {
+        let mut conn = self.redis.get().await.ok()?;
+        conn.get::<_, Option<String>>(key).await.ok().flatten()
+    }
+
+    pub(crate) async fn cluster_cache_put(&self, key: &str, json: &str, ttl: u64) {
+        if let Ok(mut conn) = self.redis.get().await {
+            let _: Result<(), _> = conn.set_ex::<_, _, ()>(key, json, ttl).await;
+        }
     }
 
     async fn cold_start_response(
@@ -400,22 +483,15 @@ impl RecommendationsService {
     }
 
     async fn recent_artists(&self, sc_user_id: &str, limit: i64) -> AppResult<HashSet<String>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
-            "SELECT LOWER(a.name) \
-             FROM user_events ue \
-             JOIN tracks it ON it.sc_track_id = ue.sc_track_id \
-             JOIN track_artists ta ON ta.track_id = it.id AND ta.role = 'primary' \
-             JOIN artists a ON a.id = ta.artist_id \
-             WHERE ue.sc_user_id = $1 \
-               AND ue.created_at > NOW() - INTERVAL '14 days' \
-             ORDER BY ue.created_at DESC \
-             LIMIT $2",
+        let ids = user_id_variants(sc_user_id);
+        let rows = sqlx::query_file_scalar!(
+            "queries/recommendations/home_wave/recent_artists.sql",
+            &ids,
+            limit
         )
-        .bind(sc_user_id)
-        .bind(limit)
         .fetch_all(&self.pg)
         .await?;
-        Ok(rows.into_iter().map(|(n,)| n).collect())
+        Ok(rows.into_iter().collect())
     }
 
     async fn load_top_artists_cluster(
@@ -430,63 +506,12 @@ impl RecommendationsService {
         // типа Psychosis выпадали). Берём только playable треки
         // (storage_state='ok'): иначе единственный выбранный недоступный трек
         // режется s3-дропом и карточка артиста исчезает целиком.
-        let rows: Vec<ArtistTrackRow> = match sqlx::query_as::<_, ArtistTrackRow>(
-            "WITH liked AS ( \
-                 SELECT sc_track_id FROM user_likes_tracks \
-                 WHERE user_id = ANY($1) AND wanted_state = true \
-                   AND created_at > NOW() - INTERVAL '180 days' \
-                 ORDER BY created_at DESC, ctid DESC \
-                 LIMIT 300 \
-             ), \
-             like_art AS ( \
-                 SELECT ta.artist_id, COUNT(*)::real AS lc \
-                 FROM liked l \
-                 JOIN tracks it ON it.sc_track_id = l.sc_track_id \
-                 JOIN track_artists ta ON ta.track_id = it.id AND ta.role = 'primary' \
-                 GROUP BY ta.artist_id \
-             ), \
-             play_art AS ( \
-                 SELECT ta.artist_id, COUNT(DISTINCT ue.sc_track_id)::real AS pc \
-                 FROM user_events ue \
-                 JOIN tracks it ON it.sc_track_id = ue.sc_track_id \
-                 JOIN track_artists ta ON ta.track_id = it.id AND ta.role = 'primary' \
-                 WHERE ue.sc_user_id = ANY($1) \
-                   AND ue.event_type IN ('full_play','play_complete') \
-                   AND ue.created_at > NOW() - INTERVAL '180 days' \
-                 GROUP BY ta.artist_id \
-             ), \
-             top_artists AS ( \
-                 SELECT COALESCE(la.artist_id, pa.artist_id) AS artist_id, \
-                     (COALESCE(la.lc, 0) + 0.5 * COALESCE(pa.pc, 0)) AS score \
-                 FROM like_art la FULL OUTER JOIN play_art pa ON pa.artist_id = la.artist_id \
-                 ORDER BY score DESC \
-                 LIMIT $2 \
-             ), \
-             ranked AS ( \
-                 SELECT \
-                     ta.artist_id, it.sc_track_id, \
-                     ROW_NUMBER() OVER ( \
-                         PARTITION BY ta.artist_id \
-                         ORDER BY \
-                             CASE WHEN it.sc_track_id = ANY($3) THEN 1 ELSE 0 END, \
-                             COALESCE(c.play_count, 0) DESC \
-                     ) AS rn \
-                 FROM top_artists tau \
-                 JOIN track_artists ta ON ta.artist_id = tau.artist_id AND ta.role = 'primary' \
-                 JOIN tracks it ON it.id = ta.track_id \
-                 LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id \
-                 WHERE it.sharing = 'public' AND it.storage_state = 'ok' \
-             ) \
-             SELECT a.id AS artist_id, a.name AS artist_name, a.avatar_url, r.sc_track_id \
-             FROM ranked r \
-             JOIN artists a ON a.id = r.artist_id \
-             JOIN top_artists tt ON tt.artist_id = r.artist_id \
-             WHERE r.rn = 1 AND a.merged_into IS NULL \
-             ORDER BY tt.score DESC",
+        let rows = match sqlx::query_file!(
+            "queries/recommendations/home_wave/top_artists_cluster.sql",
+            &ids,
+            limit,
+            &exclude_vec
         )
-            .bind(&ids)
-        .bind(limit)
-        .bind(&exclude_vec)
         .fetch_all(&self.pg)
         .await
         {
@@ -511,62 +536,12 @@ impl RecommendationsService {
     ) -> Vec<ClusterNeighbor> {
         let exclude_vec: Vec<String> = exclude.iter().cloned().collect();
         let ids = user_id_variants(sc_user_id);
-        let rows: Vec<ArtistTrackRow> = match sqlx::query_as::<_, ArtistTrackRow>(
-            "WITH recent_likes AS ( \
-                 SELECT sc_track_id FROM user_likes_tracks \
-                 WHERE user_id = ANY($1) AND wanted_state = true \
-                   AND created_at > NOW() - INTERVAL '180 days' \
-                 ORDER BY created_at DESC, ctid DESC \
-                 LIMIT 300 \
-             ), \
-             user_artists AS ( \
-                 SELECT DISTINCT ta.artist_id \
-                 FROM recent_likes rl \
-                 JOIN tracks it ON it.sc_track_id = rl.sc_track_id \
-                 JOIN track_artists ta ON ta.track_id = it.id AND ta.role = 'primary' \
-                 LIMIT 100 \
-             ), \
-             co AS ( \
-                 SELECT \
-                     (CASE WHEN ac.a_id IN (SELECT artist_id FROM user_artists) \
-                           THEN ac.b_id ELSE ac.a_id END) AS co_id, \
-                     MAX(ac.weight) AS w \
-                 FROM artist_coplay ac \
-                 WHERE (ac.a_id IN (SELECT artist_id FROM user_artists) \
-                     OR ac.b_id IN (SELECT artist_id FROM user_artists)) \
-                   AND NOT ( \
-                       ac.a_id IN (SELECT artist_id FROM user_artists) \
-                       AND ac.b_id IN (SELECT artist_id FROM user_artists) \
-                   ) \
-                 GROUP BY co_id \
-                 ORDER BY w DESC \
-                 LIMIT $2 \
-             ), \
-             ranked AS ( \
-                 SELECT \
-                     ta.artist_id, it.sc_track_id, \
-                     ROW_NUMBER() OVER ( \
-                         PARTITION BY ta.artist_id \
-                         ORDER BY \
-                             CASE WHEN it.sc_track_id = ANY($3) THEN 1 ELSE 0 END, \
-                             COALESCE(c.play_count, 0) DESC \
-                     ) AS rn, \
-                     co.w \
-                 FROM co \
-                 JOIN track_artists ta ON ta.artist_id = co.co_id AND ta.role = 'primary' \
-                 JOIN tracks it ON it.id = ta.track_id \
-                 LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id \
-                 WHERE it.sharing = 'public' AND it.storage_state = 'ok' \
-             ) \
-             SELECT a.id AS artist_id, a.name AS artist_name, a.avatar_url, r.sc_track_id \
-             FROM ranked r \
-             JOIN artists a ON a.id = r.artist_id \
-             WHERE r.rn = 1 AND a.merged_into IS NULL \
-             ORDER BY r.w DESC NULLS LAST",
+        let rows = match sqlx::query_file!(
+            "queries/recommendations/home_wave/adjacent_artists_cluster.sql",
+            &ids,
+            limit,
+            &exclude_vec
         )
-            .bind(&ids)
-        .bind(limit)
-        .bind(&exclude_vec)
         .fetch_all(&self.pg)
         .await
         {
@@ -594,44 +569,15 @@ impl RecommendationsService {
         // Артист попадает в «дропы» только если ты лайкнул его >=2 раз —
         // один случайный лайк (напр. фит, который ты не следишь) больше не
         // заливает ленту его релизами. Только playable треки.
-        let rows: Vec<(String,)> = match sqlx::query_as(
-            "WITH recent_likes AS ( \
-                 SELECT sc_track_id FROM user_likes_tracks \
-                 WHERE user_id = ANY($1) AND wanted_state = true \
-                   AND created_at > NOW() - INTERVAL '120 days' \
-                 ORDER BY created_at DESC, ctid DESC \
-                 LIMIT 200 \
-             ), \
-             user_artists AS ( \
-                 SELECT ta.artist_id \
-                 FROM recent_likes rl \
-                 JOIN tracks it ON it.sc_track_id = rl.sc_track_id \
-                 JOIN track_artists ta ON ta.track_id = it.id AND ta.role = 'primary' \
-                 GROUP BY ta.artist_id \
-                 HAVING COUNT(*) >= 2 \
-             ) \
-             SELECT it.sc_track_id \
-             FROM track_artists ta \
-             JOIN tracks it ON it.id = ta.track_id \
-             WHERE ta.artist_id IN (SELECT artist_id FROM user_artists) \
-               AND ta.role = 'primary' \
-               AND it.sharing = 'public' \
-               AND it.storage_state = 'ok' \
-               AND it.sc_synced_at > NOW() - INTERVAL '30 days' \
-               AND NOT (it.sc_track_id = ANY($2)) \
-             ORDER BY it.sc_synced_at DESC \
-             LIMIT $3",
+        sqlx::query_file_scalar!(
+            "queries/recommendations/home_wave/fresh_drops.sql",
+            &ids,
+            &exclude_vec,
+            limit
         )
-            .bind(&ids)
-        .bind(&exclude_vec)
-        .bind(limit)
         .fetch_all(&self.pg)
         .await
-        {
-            Ok(v) => v,
-            Err(_) => return Vec::new(),
-        };
-        rows.into_iter().map(|(id,)| id).collect()
+        .unwrap_or_default()
     }
 
     async fn apply_quality_filter(&self, builder: &mut ClusterBuilder) {
@@ -640,21 +586,27 @@ impl RecommendationsService {
         if all_ids.is_empty() {
             return;
         }
-        type QualityRow = (String, i32, String, Option<i64>, Option<f32>);
-        let rows: Vec<QualityRow> = sqlx::query_as(
-            "SELECT it.sc_track_id, it.duration_ms, it.title, c.play_count, it.quality_score \
-             FROM tracks it \
-             LEFT JOIN sc_track_counters c ON c.sc_track_id = it.sc_track_id \
-             WHERE it.sc_track_id = ANY($1)",
+        let rows = sqlx::query_file!(
+            "queries/recommendations/home_wave/quality_rows.sql",
+            &all_ids
         )
-        .bind(&all_ids)
         .fetch_all(&self.pg)
         .await
         .unwrap_or_default();
 
         let by_id: HashMap<String, (i32, String, i64, Option<f32>)> = rows
             .into_iter()
-            .map(|(id, dur, title, plays, q)| (id, (dur, title, plays.unwrap_or(0), q)))
+            .map(|r| {
+                (
+                    r.sc_track_id,
+                    (
+                        r.duration_ms,
+                        r.title,
+                        r.play_count.unwrap_or(0),
+                        r.quality_score,
+                    ),
+                )
+            })
             .collect();
 
         let to_drop: HashSet<String> = all_ids
@@ -691,16 +643,16 @@ impl RecommendationsService {
         if ids.is_empty() {
             return;
         }
-        let rows: Vec<(String, Option<i64>)> = sqlx::query_as(
-            "SELECT sc_track_id, play_count FROM sc_track_counters WHERE sc_track_id = ANY($1)",
+        let rows = sqlx::query_file!(
+            "queries/recommendations/home_wave/playback_counts.sql",
+            &ids
         )
-        .bind(&ids)
         .fetch_all(&self.pg)
         .await
         .unwrap_or_default();
         let by_id: HashMap<String, i64> = rows
             .into_iter()
-            .map(|(id, p)| (id, p.unwrap_or(0)))
+            .map(|r| (r.sc_track_id, r.play_count.unwrap_or(0)))
             .collect();
         for r in pool.iter_mut() {
             let id = recommend_id_str(&r.id);

@@ -58,28 +58,44 @@ use crate::sc::ScClient;
 use crate::state::AppState;
 
 const BG_TICK: Duration = Duration::from_secs(60);
+const HEAL_TICK: Duration = Duration::from_secs(300);
 const BG_WORK_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    tls_common::init_crypto();
     telemetry::init();
 
     let config = Arc::new(AppConfig::from_env());
     info!(port = config.port, "backend starting");
-    let reserve = config.premium_reserve;
+    let reserve = config.is_reserve();
     if reserve {
-        info!("premium_reserve mode ON: background pipelines disabled");
+        info!(
+            premium_reserve = config.premium_reserve,
+            reserve_backend = config.reserve_backend,
+            "reserve mode ON: background pipelines disabled"
+        );
     }
 
     let pg = db::connect(&config)
         .await
         .expect("Failed to connect to PostgreSQL");
     info!("PostgreSQL connected");
-    if let Err(e) = db::migrate(&pg).await {
-        error!(error = %e, "Failed to run migrations");
-        std::process::exit(1);
+    // Boot-time migrate is gated: set MIGRATE_ON_BOOT=false once the deploy runs the
+    // standalone `migrate` bin as a discrete pre-start step — a failed migration then
+    // fails the deploy instead of crashing app startup. Default on = current behaviour.
+    if std::env::var("MIGRATE_ON_BOOT")
+        .map(|v| v != "false")
+        .unwrap_or(true)
+    {
+        if let Err(e) = db::migrate(&pg).await {
+            error!(error = %e, "Failed to run migrations");
+            std::process::exit(1);
+        }
+        info!("Migrations applied");
+    } else {
+        info!("MIGRATE_ON_BOOT=false: migrations managed externally (run `migrate` bin)");
     }
-    info!("Migrations applied");
 
     let redis_pool = redis::connect(&config).expect("Failed to create Redis pool");
     info!("Redis pool ready");
@@ -390,11 +406,7 @@ async fn main() {
         qdrant.clone(),
     );
 
-    events.install_deps(
-        indexing.clone(),
-        dislikes.clone(),
-        collab_trainer.clone(),
-    );
+    events.install_deps(indexing.clone(), dislikes.clone(), collab_trainer.clone());
 
     if !reserve {
         crate::modules::recommendations::cron::spawn_cron_loops(
@@ -418,6 +430,24 @@ async fn main() {
                 move || {
                     let sq = sq.clone();
                     async move { sq.flush().await.map(|_| ()) }
+                },
+            )
+            .await;
+        });
+    }
+
+    if !reserve {
+        let token = shutdown.clone();
+        let sq = sync_queue.clone();
+        tasks.spawn(async move {
+            run_periodic(
+                "sync_queue.heal",
+                token,
+                HEAL_TICK,
+                BG_WORK_TIMEOUT,
+                move || {
+                    let sq = sq.clone();
+                    async move { sq.heal().await }
                 },
             )
             .await;
@@ -454,6 +484,24 @@ async fn main() {
                 move || {
                     let auth = auth.clone();
                     async move { auth.cleanup_expired_link_requests().await }
+                },
+            )
+            .await;
+        });
+    }
+
+    if !reserve {
+        let token = shutdown.clone();
+        let auth = auth.clone();
+        tasks.spawn(async move {
+            run_periodic(
+                "auth.reap_sessions",
+                token,
+                BG_TICK,
+                BG_WORK_TIMEOUT,
+                move || {
+                    let auth = auth.clone();
+                    async move { auth.reap_dead_sessions().await }
                 },
             )
             .await;

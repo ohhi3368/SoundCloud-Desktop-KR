@@ -14,6 +14,7 @@
 
 use serde_json::Value;
 
+use crate::modules::enrich::artist_names::name_similarity;
 use crate::modules::enrich::normalize::{
     compact_title, normalize_name, normalize_title, parse_sc_title,
 };
@@ -64,13 +65,23 @@ pub fn title_score(
     cand_title: &str,
     cand_uploader_username: Option<&str>,
 ) -> f32 {
+    let parsed = parse_sc_title(cand_title, cand_uploader_username);
+    title_score_parsed(target_title, cand_title, &parsed)
+}
+
+/// Вариант с уже разобранным кандидатом — `evaluate_sc_candidate` парсит
+/// title один раз на оба скора (а не дважды на каждого из сотен кандидатов).
+pub fn title_score_parsed(
+    target_title: &str,
+    cand_title: &str,
+    parsed: &crate::modules::enrich::normalize::ParsedTitle,
+) -> f32 {
     let target_n = normalize_title(target_title);
     if target_n.is_empty() {
         return 0.0;
     }
     let target_compact = compact_title(target_title);
 
-    let parsed = parse_sc_title(cand_title, cand_uploader_username);
     let cleaned_n = normalize_title(&parsed.cleaned_title);
     let cleaned_compact = compact_title(&parsed.cleaned_title);
     let raw_n = normalize_title(cand_title);
@@ -85,15 +96,16 @@ pub fn title_score(
         return 0.95;
     }
 
+    // Длины в символах: байтовый порог для кириллицы = половина задуманного.
     let min_len = 6;
-    if target_compact.len() >= min_len {
+    if target_compact.chars().count() >= min_len {
         if cleaned_compact.contains(&target_compact) || raw_compact.contains(&target_compact) {
             // целевая короче кандидата — кандидат «покрывает» wanted
             return 0.75;
         }
         if !cleaned_compact.is_empty()
             && target_compact.contains(&cleaned_compact)
-            && cleaned_compact.len() * 2 >= target_compact.len()
+            && cleaned_compact.chars().count() * 2 >= target_compact.chars().count()
         {
             return 0.65;
         }
@@ -114,63 +126,28 @@ pub fn title_score(
 /// Artist score: target = ожидаемое имя артиста (как у нас в БД),
 /// cand_uploader_username = SC username аплоадера,
 /// cand_title_parsed_artist = первый primary_artist парсера тайтла кандидата.
+/// Шкала похожести — единая, из `artist_names::name_similarity`.
 pub fn artist_score(
     target_artist: &str,
     cand_uploader_username: Option<&str>,
     cand_title_parsed_artist: Option<&str>,
 ) -> f32 {
-    let target_n = normalize_name(target_artist);
-    if target_n.is_empty() {
+    if normalize_name(target_artist).is_empty() {
         // Без эталонного имени артиста сравнивать не с чем — даём нейтральный 0.5
         // чтобы не убивать score для wanted_tracks без artist'а.
         return 0.5;
     }
-    let parsed_n = cand_title_parsed_artist
-        .map(normalize_name)
-        .unwrap_or_default();
-    let upl_n = cand_uploader_username
-        .map(normalize_name)
-        .unwrap_or_default();
-    let candidates = [parsed_n.as_str(), upl_n.as_str()];
     let mut best = 0.0f32;
-    for c in candidates.iter().filter(|s| !s.is_empty()) {
-        let s = single_artist_score(&target_n, c);
+    for c in [cand_title_parsed_artist, cand_uploader_username]
+        .into_iter()
+        .flatten()
+    {
+        let s = name_similarity(target_artist, c);
         if s > best {
             best = s;
         }
     }
     best
-}
-
-fn single_artist_score(target_n: &str, cand_n: &str) -> f32 {
-    if target_n == cand_n {
-        return 1.0;
-    }
-    let target_compact: String = target_n.chars().filter(|c| !c.is_whitespace()).collect();
-    let cand_compact: String = cand_n.chars().filter(|c| !c.is_whitespace()).collect();
-    if target_compact.is_empty() || cand_compact.is_empty() {
-        return 0.0;
-    }
-    if target_compact == cand_compact {
-        return 0.95;
-    }
-    if target_compact.len() >= 4
-        && cand_compact.len() >= 4
-        && (target_compact.contains(&cand_compact) || cand_compact.contains(&target_compact))
-    {
-        // короче должно покрывать ≥ половину длинного, иначе слишком мягко
-        let short = target_compact.len().min(cand_compact.len());
-        let long = target_compact.len().max(cand_compact.len());
-        if short * 2 >= long {
-            return 0.85;
-        }
-        return 0.55;
-    }
-    let bigram = bigram_overlap(&target_compact, &cand_compact);
-    if bigram >= 0.7 {
-        return 0.5;
-    }
-    0.0
 }
 
 pub fn duration_match(target_ms: Option<i32>, cand_ms: Option<i64>) -> DurationMatch {
@@ -217,10 +194,6 @@ fn jaccard_ratio(
     }
 }
 
-fn bigram_overlap(a: &str, b: &str) -> f32 {
-    jaccard_ratio(&ngram_set(a, 2), &ngram_set(b, 2))
-}
-
 fn trigram_overlap(a: &str, b: &str) -> f32 {
     jaccard_ratio(&ngram_set(a, 3), &ngram_set(b, 3))
 }
@@ -255,7 +228,7 @@ pub fn evaluate_sc_candidate(
     let cand_parsed_artist = parsed.primary_artists.first().map(|s| s.as_str());
 
     TrackMatch {
-        title_score: title_score(wanted_title, cand_title, cand_uploader),
+        title_score: title_score_parsed(wanted_title, cand_title, &parsed),
         artist_score: artist_score(wanted_artist, cand_uploader, cand_parsed_artist),
         duration_match: duration_match(wanted_duration_ms, cand_duration_ms),
         isrc_match: matches!((wanted_isrc, cand_isrc), (Some(a), Some(b)) if a.eq_ignore_ascii_case(b)),

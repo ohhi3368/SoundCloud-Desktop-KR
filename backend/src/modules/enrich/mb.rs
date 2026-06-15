@@ -36,6 +36,8 @@ pub struct MbRecording {
 
 #[derive(Debug, Clone)]
 pub struct MbArtistDetails {
+    /// Имя СУЩНОСТИ (не кредит-алиас с релиза).
+    pub name: Option<String>,
     pub country: Option<String>,
     pub disambiguation: Option<String>,
     pub urls: Vec<MbArtistUrl>,
@@ -130,6 +132,10 @@ impl MbClient {
         );
         let body: Option<ArtistPayload> = self.fetch(&url).await?;
         Ok(body.map(|p| MbArtistDetails {
+            name: p
+                .name
+                .map(|n| n.trim().to_string())
+                .filter(|n| !n.is_empty()),
             country: p.country,
             disambiguation: p.disambiguation.filter(|s| !s.is_empty()),
             urls: p
@@ -175,9 +181,12 @@ impl MbClient {
                 let mut artists: Vec<MbArtist> = credits
                     .into_iter()
                     .filter_map(|c| {
+                        // Имя СУЩНОСТИ, не кредит-алиас: на релизе артист бывает
+                        // подписан сценическим сокращением ("SID" у SIDODJI
+                        // DUBOSHIT) — алиас минтит артиста-двойника.
                         c.artist.map(|a| MbArtist {
                             mb_id: a.id,
-                            name: c.name.unwrap_or(a.name),
+                            name: a.name,
                         })
                     })
                     .collect();
@@ -323,7 +332,7 @@ fn recording_from_payload(r: RecordingPayload, score: u32) -> MbRecording {
         .filter_map(|c| {
             c.artist.as_ref().map(|a| MbArtist {
                 mb_id: a.id.clone(),
-                name: c.name.clone().unwrap_or_else(|| a.name.clone()),
+                name: a.name.clone(),
             })
         })
         .collect();
@@ -342,7 +351,7 @@ fn recording_from_payload(r: RecordingPayload, score: u32) -> MbRecording {
         let release_primary = release_credits.into_iter().next().and_then(|c| {
             c.artist.map(|a| MbArtist {
                 mb_id: a.id,
-                name: c.name.unwrap_or(a.name),
+                name: a.name,
             })
         });
         MbRelease {
@@ -408,8 +417,6 @@ struct BrowseRecording {
 #[derive(Debug, Deserialize)]
 struct RawCredit {
     #[serde(default)]
-    name: Option<String>,
-    #[serde(default)]
     artist: Option<RawArtist>,
 }
 
@@ -439,6 +446,8 @@ struct RawReleaseGroup {
 
 #[derive(Debug, Deserialize)]
 struct ArtistPayload {
+    #[serde(default)]
+    name: Option<String>,
     #[serde(default)]
     country: Option<String>,
     #[serde(default)]

@@ -9,7 +9,6 @@ use uuid::Uuid;
 use crate::common::query::parse_languages;
 use crate::common::session::SessionCtx;
 use crate::error::AppResult;
-use crate::modules::recommendations::clusters::ClusterResponse;
 use crate::modules::recommendations::home_wave::HomeRequest;
 use crate::modules::recommendations::service::RecommendResult;
 use crate::modules::recommendations::smart_wave::{
@@ -42,12 +41,22 @@ fn parse_limit(raw: Option<&str>, fallback: usize) -> usize {
         .unwrap_or(fallback)
 }
 
+/// Булев query-флаг. Дефолт ON; `?flag=0/false/no` → OFF.
+fn parse_flag(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some(s) => !matches!(s.trim(), "0" | "false" | "no"),
+        None => default,
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct HomeQuery {
     #[serde(default)]
     limit: Option<String>,
     #[serde(default)]
     languages: Option<String>,
+    #[serde(default)]
+    hide_listened: Option<String>,
 }
 
 async fn home(
@@ -56,10 +65,10 @@ async fn home(
     Query(q): Query<HomeQuery>,
 ) -> AppResult<Response> {
     if ctx.sc_user_id.is_empty() {
-        return Ok(Json(
-            crate::modules::recommendations::clusters::ClusterBuilder::new().finish(),
-        )
-            .into_response());
+        return Ok(
+            Json(crate::modules::recommendations::clusters::ClusterBuilder::new().finish())
+                .into_response(),
+        );
     }
     let per_cluster = parse_limit(q.limit.as_deref(), 16);
     let languages = parse_languages(q.languages.as_deref());
@@ -67,6 +76,7 @@ async fn home(
         sc_user_id: ctx.sc_user_id.clone(),
         languages,
         per_cluster,
+        hide_listened: parse_flag(q.hide_listened.as_deref(), true),
     };
     // Кэшированный JSON (короткий TTL) — снимает повтор ANN-сборки кластеров.
     let json = st.recommendations.home_wave_cached(req).await?;
@@ -79,6 +89,8 @@ struct SimilarQuery {
     limit: Option<String>,
     #[serde(default)]
     languages: Option<String>,
+    #[serde(default)]
+    hide_listened: Option<String>,
 }
 
 async fn similar(
@@ -86,25 +98,28 @@ async fn similar(
     ctx: SessionCtx,
     Path(track_id): Path<String>,
     Query(q): Query<SimilarQuery>,
-) -> AppResult<Json<ClusterResponse>> {
+) -> AppResult<Response> {
     let per_cluster = parse_limit(q.limit.as_deref(), 12);
     let languages = parse_languages(q.languages.as_deref());
-    let out = st
+    let json = st
         .recommendations
-        .similar_wave(
+        .similar_wave_cached(
             &track_id,
             &ctx.sc_user_id,
             languages.as_deref(),
             per_cluster,
+            parse_flag(q.hide_listened.as_deref(), true),
         )
         .await?;
-    Ok(Json(out))
+    Ok(([(header::CONTENT_TYPE, "application/json")], json).into_response())
 }
 
 #[derive(Debug, Deserialize)]
 struct ArtistQuery {
     #[serde(default)]
     limit: Option<String>,
+    #[serde(default)]
+    hide_listened: Option<String>,
 }
 
 async fn artist(
@@ -112,13 +127,18 @@ async fn artist(
     ctx: SessionCtx,
     Path(artist_id): Path<Uuid>,
     Query(q): Query<ArtistQuery>,
-) -> AppResult<Json<ClusterResponse>> {
+) -> AppResult<Response> {
     let per_cluster = parse_limit(q.limit.as_deref(), 14);
-    let out = st
+    let json = st
         .recommendations
-        .artist_wave(artist_id, &ctx.sc_user_id, per_cluster)
+        .artist_wave_cached(
+            artist_id,
+            &ctx.sc_user_id,
+            per_cluster,
+            parse_flag(q.hide_listened.as_deref(), true),
+        )
         .await?;
-    Ok(Json(out))
+    Ok(([(header::CONTENT_TYPE, "application/json")], json).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -184,6 +204,8 @@ struct WaveQuery {
     languages: Option<String>,
     #[serde(default)]
     cursor: Option<String>,
+    #[serde(default)]
+    hide_listened: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +233,7 @@ async fn wave_user(
         limit,
         cursor_token: q.cursor.as_deref(),
         seed: SmartWaveSeed::User,
+        hide_listened: parse_flag(q.hide_listened.as_deref(), true),
     };
     let SmartWaveResponse { tracks, cursor } = smart_wave::build(&st.recommendations, req).await?;
     Ok(Json(WavePayload { tracks, cursor }))
@@ -236,6 +259,7 @@ async fn wave_track(
         limit,
         cursor_token: q.cursor.as_deref(),
         seed: SmartWaveSeed::Track(seed),
+        hide_listened: parse_flag(q.hide_listened.as_deref(), true),
     };
     let SmartWaveResponse { tracks, cursor } = smart_wave::build(&st.recommendations, req).await?;
     Ok(Json(WavePayload { tracks, cursor }))
@@ -260,6 +284,7 @@ async fn wave_artist(
         limit,
         cursor_token: q.cursor.as_deref(),
         seed: SmartWaveSeed::Artist(artist_id, &top_tracks),
+        hide_listened: parse_flag(q.hide_listened.as_deref(), true),
     };
     let SmartWaveResponse { tracks, cursor } = smart_wave::build(&st.recommendations, req).await?;
     Ok(Json(WavePayload { tracks, cursor }))

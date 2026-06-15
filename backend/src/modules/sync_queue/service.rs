@@ -39,6 +39,8 @@ pub struct SyncQueueRow {
     pub last_error: Option<String>,
     pub next_run_at: DateTime<Utc>,
     pub created_at: DateTime<Utc>,
+    pub dead: bool,
+    pub failed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,15 +85,11 @@ impl SyncQueueService {
             }
         }
 
-        let (pending, failed): (i64, i64) = sqlx::query_as(
-            "SELECT \
-                 COUNT(*) FILTER (WHERE retry_count = 0)::bigint, \
-                 COUNT(*) FILTER (WHERE retry_count > 0)::bigint \
-             FROM sync_queue WHERE user_id = $1",
-        )
-        .bind(sc_user_id)
-        .fetch_one(&self.pg)
-        .await?;
+        let variants = crate::common::sc_ids::user_id_variants(sc_user_id);
+        let row = sqlx::query_file!("queries/sync_queue/service/pending_counts.sql", &variants)
+            .fetch_one(&self.pg)
+            .await?;
+        let (pending, failed) = (row.pending, row.failed);
 
         if let Ok(mut conn) = self.redis.get().await {
             let payload = format!("{pending}:{failed}");
@@ -115,13 +113,12 @@ impl SyncQueueService {
         payload: Option<&Value>,
     ) -> AppResult<()> {
         if let Some(inv) = actions::inverse(action_type) {
-            let cancelled = sqlx::query(
-                "DELETE FROM sync_queue \
-                 WHERE user_id = $1 AND action_type = $2 AND target_urn = $3 AND locked_at IS NULL",
+            let cancelled = sqlx::query_file!(
+                "queries/sync_queue/service/cancel_inverse.sql",
+                user_id,
+                inv,
+                target_urn
             )
-            .bind(user_id)
-            .bind(inv)
-            .bind(target_urn)
             .execute(&self.pg)
             .await?;
             if cancelled.rows_affected() > 0 {
@@ -164,10 +161,18 @@ impl SyncQueueService {
                 let _permit = sem.acquire().await;
                 match self.execute_one(&row).await {
                     Ok(()) => {
-                        if let Err(e) = sqlx::query("DELETE FROM sync_queue WHERE id = $1")
-                            .bind(row.id)
-                            .execute(&self.pg)
-                            .await
+                        // Optimistic delete: только если строку не «тронул» enqueue
+                        // конкурентной правки (locked_at не изменился с момента
+                        // claim). Иначе строка переживает и переотправит свежий
+                        // стейт следующим тиком — фикс lost-write под гонкой
+                        // (в т.ч. playlist_sync при правке во время in-flight PUT).
+                        if let Err(e) = sqlx::query_file!(
+                            "queries/sync_queue/service/delete_if_unchanged.sql",
+                            row.id,
+                            row.locked_at
+                        )
+                        .execute(&self.pg)
+                        .await
                         {
                             warn!(error = %e, "sync_queue delete failed");
                         }
@@ -182,30 +187,83 @@ impl SyncQueueService {
                 }
             }
         }))
-            .await;
+        .await;
         let synced = results.iter().filter(|&&ok| ok).count();
         let failed = results.len() - synced;
         Ok(FlushStats { synced, failed })
     }
 
+    /// Heal-свип (отдельный тик, не из flush): делает permanent loss
+    /// невозможным. Реэнкюивает намерение из mirror/desired-state, которое могло
+    /// не доехать (потерянный когда-то action или зависший progress=true), и
+    /// оживляет dead-строки, пока их намерение ещё актуально (ON CONFLICT).
+    /// NOT EXISTS гейтит только по ЖИВЫМ (dead=false) queue-row, поэтому
+    /// конфликт всегда попадает на dead-строку → полное оживление. Каждый
+    /// стейтмент с LIMIT — тик дёшев.
+    pub async fn heal(&self) -> AppResult<()> {
+        // Лайки треков (bare sc_track_id → urn для совпадения с enqueue call-site).
+        sqlx::query_file!("queries/sync_queue/service/heal_likes_tracks.sql")
+            .execute(&self.pg)
+            .await?;
+
+        // Лайки плейлистов (key = playlist_urn).
+        sqlx::query_file!("queries/sync_queue/service/heal_likes_playlists.sql")
+            .execute(&self.pg)
+            .await?;
+
+        // Фолловинги (key = target_user_urn).
+        sqlx::query_file!("queries/sync_queue/service/heal_followings.sql")
+            .execute(&self.pg)
+            .await?;
+
+        // Owned-плейлисты с pending desired_rev > synced_rev без живого sync.
+        sqlx::query_file!("queries/sync_queue/service/heal_playlists.sql")
+            .execute(&self.pg)
+            .await?;
+
+        // Гигиена: очень старые dead-строки (>30 дней) — аудит-след исчерпан.
+        let _ = sqlx::query_file!("queries/sync_queue/service/delete_old_dead.sql")
+            .execute(&self.pg)
+            .await;
+
+        Ok(())
+    }
+
     async fn claim_batch(&self, limit: i64) -> AppResult<Vec<SyncQueueRow>> {
         let lock_timeout = Utc::now() - chrono::Duration::from_std(LOCK_TIMEOUT).unwrap();
-        let rows: Vec<SyncQueueRow> = sqlx::query_as(
-            "UPDATE sync_queue SET locked_at = now() \
-             WHERE id IN ( \
-                 SELECT id FROM sync_queue \
-                 WHERE (locked_at IS NULL OR locked_at < $1) \
-                   AND next_run_at <= now() \
-                 ORDER BY next_run_at ASC, created_at ASC \
-                 FOR UPDATE SKIP LOCKED \
-                 LIMIT $2 \
-             ) RETURNING *",
+        // Не берём dead-строки; не берём таргет, у которого уже есть живой lease
+        // другого воркера (per-(user,target) сериализация: like→unlike и
+        // последовательные правки одного таргета не выполняются параллельно).
+        let rows: Vec<SyncQueueRow> = sqlx::query_file_as!(
+            SyncQueueRow,
+            "queries/sync_queue/service/claim_batch.sql",
+            lock_timeout,
+            limit
         )
-        .bind(lock_timeout)
-        .bind(limit)
         .fetch_all(&self.pg)
         .await?;
-        Ok(rows)
+
+        // В пределах одного батча anti-join не спасает (ни одна строка ещё не
+        // была locked в снапшоте). Оставляем на исполнение только самую раннюю
+        // строку на (user_id, target_urn), остальным сразу снимаем lock —
+        // выполнятся следующим тиком после первой.
+        let mut seen: std::collections::HashSet<(String, String)> =
+            std::collections::HashSet::new();
+        let mut keep: Vec<SyncQueueRow> = Vec::with_capacity(rows.len());
+        let mut release: Vec<Uuid> = Vec::new();
+        for row in rows {
+            if seen.insert((row.user_id.clone(), row.target_urn.clone())) {
+                keep.push(row);
+            } else {
+                release.push(row.id);
+            }
+        }
+        if !release.is_empty() {
+            let _ = sqlx::query_file!("queries/sync_queue/service/release_locks.sql", &release)
+                .execute(&self.pg)
+                .await;
+        }
+        Ok(keep)
     }
 
     async fn execute_one(&self, row: &SyncQueueRow) -> AppResult<()> {
@@ -213,11 +271,14 @@ impl SyncQueueService {
             .auth
             .get_valid_access_token_for_user(&row.user_id)
             .await?;
+        // Канон user_id для mirror-апдейтов экшенов — bare (совпадает с тем, что
+        // пишут set_wanted/refresh). Token lookup выше берёт raw (variant-tolerant).
+        let action_user_id = crate::common::sc_ids::extract_sc_id(&row.user_id);
         let ctx = ActionCtx {
             sc: &self.sc,
             pg: &self.pg,
             token: &token,
-            user_id: &row.user_id,
+            user_id: action_user_id,
             target_urn: &row.target_urn,
             payload: row.payload.as_ref(),
         };
@@ -244,32 +305,33 @@ impl SyncQueueService {
             // инкремента, чтобы первая ошибка дала 2 мин, не 1.
             let next = row.retry_count + 1;
             if next >= MAX_RETRIES {
-                sqlx::query("DELETE FROM sync_queue WHERE id = $1")
-                    .bind(row.id)
-                    .execute(&self.pg)
-                    .await?;
+                // НЕ удаляем — паркуем (dead). Намерение durable, видно в admin/
+                // badge, heal-свип оживит его пока desired-state его хочет.
+                sqlx::query_file!(
+                    "queries/sync_queue/service/park_dead.sql",
+                    &msg,
+                    next,
+                    row.id
+                )
+                .execute(&self.pg)
+                .await?;
                 warn!(
                     action = %row.action_type,
                     target = %row.target_urn,
                     user = %row.user_id,
                     retries = next,
                     error = %msg,
-                    "sync_queue action gave up after MAX_RETRIES"
+                    "sync_queue action parked as dead after MAX_RETRIES"
                 );
                 return Ok(());
             }
             let secs = (60i64.saturating_mul(1 << next)).min(BACKOFF_CAP_SEC);
-            sqlx::query(
-                "UPDATE sync_queue SET \
-                    locked_at = NULL, \
-                    retry_count = retry_count + 1, \
-                    last_error = $1, \
-                    next_run_at = now() + ($2 || ' seconds')::interval \
-                 WHERE id = $3",
+            sqlx::query_file!(
+                "queries/sync_queue/service/retry_backoff.sql",
+                &msg,
+                secs,
+                row.id
             )
-            .bind(&msg)
-            .bind(secs)
-            .bind(row.id)
             .execute(&self.pg)
             .await?;
             warn!(
@@ -282,16 +344,12 @@ impl SyncQueueService {
             return Ok(());
         };
 
-        sqlx::query(
-            "UPDATE sync_queue SET \
-                locked_at = NULL, \
-                last_error = $1, \
-                next_run_at = now() + ($2 || ' seconds')::interval \
-             WHERE id = $3",
+        sqlx::query_file!(
+            "queries/sync_queue/service/external_backoff.sql",
+            &msg,
+            backoff_sec,
+            row.id
         )
-        .bind(&msg)
-        .bind(backoff_sec)
-        .bind(row.id)
         .execute(&self.pg)
         .await?;
         warn!(

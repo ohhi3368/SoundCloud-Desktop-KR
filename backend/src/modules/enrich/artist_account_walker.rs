@@ -53,16 +53,12 @@ impl ArtistAccountWalker {
     }
 
     pub async fn walk_artist(&self, artist_id: Uuid, artist_name: &str) -> AppResult<()> {
-        let accounts: Vec<String> = sqlx::query_as(
-            "SELECT sc_user_id FROM artist_sc_accounts \
-             WHERE artist_id = $1 AND role IN ('main', 'alt', 'demo')",
+        let accounts: Vec<String> = sqlx::query_file_scalar!(
+            "queries/enrich/artist_account_walker/list_accounts.sql",
+            artist_id
         )
-        .bind(artist_id)
         .fetch_all(&self.pg)
-        .await?
-        .into_iter()
-        .map(|(s,): (String,)| s)
-        .collect();
+        .await?;
         if accounts.is_empty() {
             return Ok(());
         }
@@ -104,23 +100,27 @@ impl ArtistAccountWalker {
                     debug!(error = %e, sc_track_id, "walker: ingest failed");
                     continue;
                 }
+                // Лейбловая мета знает авторов: если она живая и артиста в ней
+                // нет — это чужой трек на его аккаунте (компиляция, OST-залив).
+                // Трек уже ingest'нут, но primary не присваиваем — пусть решает
+                // enrich-pipeline.
+                if !meta_allows_artist(&tr, artist_name) {
+                    continue;
+                }
                 if let Some(track_row) = self.tracks.find_by_sc_track_id(&sc_track_id).await? {
                     if track_row.primary_artist_id.is_none() {
-                        let _ = sqlx::query(
-                            "INSERT INTO track_artists (track_id, artist_id, role, position, source, confidence) \
-                             VALUES ($1, $2, 'primary', 0, 'walker', 0.85) \
-                             ON CONFLICT (track_id, artist_id, role) DO NOTHING",
+                        let _ = sqlx::query_file!(
+                            "queries/enrich/artist_account_walker/insert_track_artist.sql",
+                            track_row.id,
+                            artist_id
                         )
-                        .bind(track_row.id)
-                        .bind(artist_id)
                         .execute(&self.pg)
                         .await;
-                        let _ = sqlx::query(
-                            "UPDATE tracks SET primary_artist_id = $2, updated_at = now() \
-                             WHERE id = $1 AND primary_artist_id IS NULL",
+                        let _ = sqlx::query_file!(
+                            "queries/enrich/artist_account_walker/set_primary_artist.sql",
+                            track_row.id,
+                            artist_id
                         )
-                        .bind(track_row.id)
-                        .bind(artist_id)
                         .execute(&self.pg)
                         .await;
                         new_count += 1;
@@ -129,14 +129,13 @@ impl ArtistAccountWalker {
             }
         }
         if let Some(a) = avatar {
-            let _ = sqlx::query(
-                "UPDATE artists SET avatar_url = COALESCE(avatar_url, $2), updated_at = now()
-                 WHERE id = $1",
+            let _ = sqlx::query_file!(
+                "queries/enrich/artist_account_walker/set_avatar.sql",
+                artist_id,
+                &a
             )
-                .bind(artist_id)
-                .bind(&a)
-                .execute(&self.pg)
-                .await;
+            .execute(&self.pg)
+            .await;
         }
         if new_count > 0 {
             info!(%artist_id, attached = new_count, "artist_account_walker: linked");
@@ -197,6 +196,20 @@ impl ArtistAccountWalker {
         }
         Ok(acc)
     }
+}
+
+/// Мета пуста/мусорная → не мешаем. Живая мета должна знать артиста, иначе
+/// трек на его аккаунте — чужой (компиляция, OST, диджейский залив).
+fn meta_allows_artist(track: &Value, artist_name: &str) -> bool {
+    let Some(meta) = track.get("metadata_artist").and_then(|v| v.as_str()) else {
+        return true;
+    };
+    let names = crate::modules::enrich::artist_names::meta_artist_names(meta);
+    names.is_empty()
+        || crate::modules::enrich::artist_names::name_in(
+            artist_name,
+            names.iter().map(|s| s.as_str()),
+        )
 }
 
 /// Артист считается «нашим» для этого трека если либо:

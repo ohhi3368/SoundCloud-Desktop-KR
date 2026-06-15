@@ -58,9 +58,11 @@ impl ScTrackFields {
         if raw_title.is_empty() {
             return None;
         }
-        // Срезаем хвостовую транскрипцию: "трек (translit)" → "трек".
-        // Кейс реальный для треков с Genius / релизов с CJK-названиями.
-        let title = crate::modules::enrich::normalize::strip_translit_parens(raw_title);
+        // Дважды-кодированный JSON оставляет в строках литеральные \uXXXX —
+        // декодируем до любой другой обработки. Хранимый title дальше НЕ
+        // трогаем: «(translit)»-хвосты и теги — забота display/match-слоёв,
+        // ingest-стрип молча портил оригиналы ("Дико тусим (Speed Up)").
+        let title = crate::modules::enrich::artist_names::unescape_json_unicode(raw_title);
         let title_normalized = normalize_title(&title);
 
         let description = string_field(payload, "description");
@@ -88,7 +90,8 @@ impl ScTrackFields {
         let waveform_url = string_field(payload, "waveform_url");
         let language = string_field(payload, "language");
         let isrc = extract_isrc(payload);
-        let metadata_artist = string_field(payload, "metadata_artist");
+        let metadata_artist = string_field(payload, "metadata_artist")
+            .map(|s| crate::modules::enrich::artist_names::unescape_json_unicode(&s));
         let sharing = string_field(payload, "sharing").unwrap_or_else(|| "public".into());
 
         let sc_created_at = parse_dt(payload.get("created_at"));
