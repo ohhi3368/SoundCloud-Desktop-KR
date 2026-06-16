@@ -379,7 +379,8 @@
     "retry": "Try again",
     "reload": "Reload",
     "home": "Home",
-    "details": "Details"
+    "details": "Details",
+    "serverError": "서버 오류 ({{status}})"
   },
   "home": {
     "yourWave": "Your wave",
@@ -472,7 +473,23 @@
     "searchResultsCount_one": "{{count}}곡",
     "searchResultsCount_other": "{{count}}곡",
     "searchEmptyTitle": "이 분위기에 맞는 결과가 없습니다",
-    "searchEmptyDesc": "기분, 악기, 장면처럼 다른 단어로 검색해 보세요"
+    "searchEmptyDesc": "기분, 악기, 장면처럼 다른 단어로 검색해 보세요",
+    "hideListenedLabel": "새로운 트랙만",
+    "hideListenedOn": "최근 들은 곡 숨기기 — 좋아요한 곡 7일, 들은 곡 14일, 기타 30일 동안 숨깁니다",
+    "hideListenedOff": "이미 들은 곡을 숨기려면 켜세요",
+    "river": {
+      "live": "현재 스트림",
+      "personal": "개인용 흐름 · 끊임없이 이어집니다",
+      "adapts": "당신에게 맞춰 변화합니다",
+      "queueInf": "흐름이 계속해서 대기열을 채웁니다 — 음악이 끊기지 않습니다",
+      "playWave": "흐름 타기",
+      "freshBadge": "새로운 트랙",
+      "relToday": "오늘",
+      "relYesterday": "어제",
+      "deltaNote": "흐름이 계속됩니다 — 대기열이 자동으로 채워집니다",
+      "archiveTitle": "저장된 트랙",
+      "archiveWhy": "좋아요와 취향 기반 추천 트랙 — 조용한 흐름"
+    }
   },
   "offline": {
     "offlineBadge": "네트워크 없음",
@@ -503,7 +520,64 @@
     "lastSync": "마지막 좋아요 동기화: {{date}}",
     "openSettings": "캐시 설정",
     "likesSubtitle": "{{total}}개 중 {{cached}}개가 이미 로컬에 저장되어 오프라인에서 재생 가능해요",
-    "cachedSubtitle": "이미 로컬 오디오 파일이 있는 모든 곡"
+    "cachedSubtitle": "이미 로컬 오디오 파일이 있는 모든 곡",
+    "kicker": "오프라인 · 변환 포지",
+    "title": "로컬 라이브러리",
+    "netOnline": "온라인",
+    "netOffline": "오프라인",
+    "forgeTitle": "포지",
+    "forgeSub": "컨베이어 A → B",
+    "ffmpeg_ready": "ffmpeg 준비됨",
+    "ffmpeg_preparing": "ffmpeg 준비 중",
+    "ffmpeg_unavailable": "ffmpeg 사용 불가",
+    "stRaw": "원본 · A",
+    "stRawSub": "변환 대기 중",
+    "stForge": "변환 작업 중",
+    "stForgeSubActive": "지금 변환 중",
+    "stForgeSubIdle": "변환기 유휴 상태",
+    "stClean": "완료 · M4A",
+    "stCleanSub": "정리된 파일",
+    "forgeLogActive": "변환 중: {{title}}",
+    "forgeLogWaiting": "원본 준비됨 — ffmpeg 대기 중",
+    "forgeLogQueued_one": "원본 파일 {{count}}개 대기 중",
+    "forgeLogQueued_other": "원본 파일 {{count}}개 대기 중",
+    "forgeLogIdle": "모든 변환 완료 — 컨베이어 유휴 상태",
+    "storeTitle": "저장 공간",
+    "fileCount_one": "파일 {{count}}개",
+    "fileCount_other": "파일 {{count}}개",
+    "storeOfLimit": "{{limit}} 중 · 캐시 한도",
+    "storeNoLimit": "캐시 한도 없음",
+    "legendLikes": "좋아요 · 보호됨 {{size}}",
+    "legendCache": "캐시 · {{size}}",
+    "legendFree": "남은 용량 {{size}}",
+    "likesCoverage": "좋아요 저장 비율",
+    "coverageOf": "/ 총 {{total}}개 중 다운로드됨",
+    "likesAllCached": "모든 좋아요가 다운로드되었습니다",
+    "ctaCacheLikes": "모든 좋아요 다운로드",
+    "ctaCaching": "모든 좋아요 다운로드 중",
+    "ctaStarting": "목록 불러오는 중...",
+    "ctaPhase": "파일 다운로드 중",
+    "playAll": "모두 재생",
+    "shuffle": "섞기",
+    "sortLabel": "정렬",
+    "sortCustom": "사용자 지정 순서",
+    "sortLiked": "좋아요 순서",
+    "sort_recent": "최근",
+    "sort_title": "제목",
+    "sort_artist": "아티스트",
+    "sort_duration": "길이",
+    "sort_size": "크기",
+    "listTrack": "트랙",
+    "listStamp": "진행 상태",
+    "listWeight": "용량",
+    "listTime": "시간",
+    "stampForging": "변환 중",
+    "stampPreview": "미리보기",
+    "stampMissing": "파일 없음",
+    "rowForging": "변환 중 · ffmpeg",
+    "actPlay": "재생",
+    "actDownload": "기기에 다운로드",
+    "actSave": "파일로 저장"
   },
   "settings": {
     "title": "설정",
@@ -718,7 +792,8 @@
       "title": "Artist PRO 구독자",
       "description": "앱이 막히기 더 어려워지도록 도와주세요. Discord로 연락 바랍니다!",
       "body": "SoundCloud에서 Artist PRO를 구독 중이라면, 이 프로젝트가 밴을 당하지 않도록 도와주실 수 있어요.\n\nDiscord에서 @nonameex666에게 연락해 주세요. 계정에 연결된 OAuth 앱을 만들어 드릴게요. 로테이션 풀에 앱이 많아질수록 SoundCloud가 우리를 한 번에 모두 밴 하기가 더 어려워집니다.\n\n계정에는 어떤 영향도 없습니다. 이 앱은 API 인증에만 사용됩니다."
-    }
+    },
+    "close": "닫기"
   },
   "call": {
     "title": "피어 네트워크",
@@ -853,5 +928,25 @@
     "bulkSuccess_other": "{{count}}곡을 캐시했습니다",
     "bulkFailed_one": "{{count}}곡 캐시에 실패했습니다",
     "bulkFailed_other": "{{count}}곡 캐시에 실패했습니다"
+  },
+  "hostStatus": {
+    "starOffer": {
+      "title": "메인 호스트가 다운되었습니다",
+      "body": "메인 호스트가 다운되었지만 Star 구독자용 백업 호스트는 작동 중입니다. 구독을 이용하시면 앱을 정상적으로 이용할 수 있습니다.",
+      "how": "구독은 Boosty와 Discord를 통해 관리됩니다:"
+    },
+    "allDown": {
+      "title": "모든 호스트가 다운되었습니다",
+      "body": "서비스를 일시적으로 사용할 수 없습니다 — 복구 중입니다. 다운로드한 음악은 오프라인 라이브러리에서 들으실 수 있습니다."
+    },
+    "banner": {
+      "viaStar": "메인 서버 다운 — Star 백업 호스트에서 실행 중입니다.",
+      "outage": "호스트에 연결할 수 없습니다",
+      "details": "자세히 보기"
+    },
+    "actions": {
+      "retry": "다시 확인하기",
+      "offlineLibrary": "오프라인 라이브러리"
+    }
   }
 }
